@@ -181,144 +181,14 @@ if(BUILD_LV2)
     file(GLOB_RECURSE LIB_MODEL_SOURCES
         "${CMAKE_CURRENT_LIST_DIR}/Lib/Model/*.cpp"
     )
-    # Exclude BasicPitchCNN.h's companion .cpp if it conflicts — NeuralNote
-    # already links it via RTNeural; adjust if your build differs.
 
-    add_library(NeuralNoteGuitar2Midi_LV2 MODULE
-        LV2/neuralnote_guitar2midi.cpp
-        ${LIB_MODEL_SOURCES}
-    )
-
-    # Match the prefix convention LV2 hosts expect (.so, not lib*.so)
-    set_target_properties(NeuralNoteGuitar2Midi_LV2 PROPERTIES
-        PREFIX ""
-        OUTPUT_NAME "neuralnote_guitar2midi"
-        LIBRARY_OUTPUT_DIRECTORY "${LV2_BUNDLE_DIR}"
-    )
-
-    target_compile_features(NeuralNoteGuitar2Midi_LV2 PRIVATE cxx_std_17)
-
-    # ── SIMD auto-detection ──────────────────────────────────────────────────
-    # cmake_cxx_source_runs() compiles *and executes* a small probe program on
-    # the build host.  Because we build directly on the target Pi (not cross-
-    # compiling), this correctly distinguishes:
-    #
-    #   Raspberry Pi 4  (Cortex-A72, ARMv8-A)    →  armv8-a+neon
-    #   Raspberry Pi 5  (Cortex-A76, ARMv8.2-A)  →  armv8.2-a+dotprod+fp16
-    #   x86-64 with AVX2 + FMA                    →  avx2+fma
-    #   x86-64 with SSE4.2                        →  sse4.2
-    #
-    # The detected level is baked into NEURALNOTE_SIMD_LEVEL (a string) so the
-    # plugin can log it at instantiation time.  Results are CMake-cached; wipe
-    # the build directory or run cmake with -UNEURALNOTE_HAVE_* to re-probe.
-    include(CheckCXXSourceRuns)
-
-    set(_NN_MARCH "")          # -march=<value>; empty = let compiler choose
-    set(_NN_SIMD  "baseline")  # human-readable label passed to the plugin
-
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-        # ── AArch64 ───────────────────────────────────────────────────────────
-        # Probe ARMv8.2-A + dotprod + fp16 (Raspberry Pi 5 / Cortex-A76).
-        # The sdot instruction raises SIGILL on Pi 4 (ARMv8-A / Cortex-A72),
-        # so the run-test naturally fails there and we fall back to plain NEON.
-        set(CMAKE_REQUIRED_FLAGS "-march=armv8.2-a+dotprod+fp16")
-        check_cxx_source_runs([[
-            #include <arm_neon.h>
-            int main() {
-                int32x4_t acc = vdupq_n_s32(0);
-                int8x16_t a = vdupq_n_s8(3), b = vdupq_n_s8(2);
-                acc = vdotq_s32(acc, a, b);  /* sdot: ARMv8.2-A only */
-                return (vgetq_lane_s32(acc, 0) == 24) ? 0 : 1;
-            }
-        ]] NEURALNOTE_HAVE_ARMV82_DOTPROD)
-        unset(CMAKE_REQUIRED_FLAGS)
-
-        if(NEURALNOTE_HAVE_ARMV82_DOTPROD)
-            set(_NN_MARCH "armv8.2-a+dotprod+fp16")
-            set(_NN_SIMD  "armv8.2-a+dotprod+fp16")
-        else()
-            # Probe baseline ARMv8-A NEON (Raspberry Pi 4 / Cortex-A72)
-            set(CMAKE_REQUIRED_FLAGS "-march=armv8-a+simd")
-            check_cxx_source_runs([[
-                #include <arm_neon.h>
-                int main() {
-                    float32x4_t a = vdupq_n_f32(1.0f), b = vdupq_n_f32(2.0f);
-                    float32x4_t c = vmulq_f32(a, b);
-                    return (vgetq_lane_f32(c, 0) > 1.9f) ? 0 : 1;
-                }
-            ]] NEURALNOTE_HAVE_NEON)
-            unset(CMAKE_REQUIRED_FLAGS)
-            if(NEURALNOTE_HAVE_NEON)
-                set(_NN_MARCH "armv8-a+simd")
-                set(_NN_SIMD  "armv8-a+neon")
-            endif()
-        endif()
-
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-        # ── x86-64 ────────────────────────────────────────────────────────────
-        set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma")
-        check_cxx_source_runs([[
-            #include <immintrin.h>
-            int main() {
-                __m256 a = _mm256_set1_ps(1.5f), b = _mm256_set1_ps(2.0f);
-                __m256 c = _mm256_mul_ps(a, b);
-                float r[8]; _mm256_storeu_ps(r, c);
-                return (r[0] > 2.9f) ? 0 : 1;
-            }
-        ]] NEURALNOTE_HAVE_AVX2)
-        unset(CMAKE_REQUIRED_FLAGS)
-
-        if(NEURALNOTE_HAVE_AVX2)
-            target_compile_options(NeuralNoteGuitar2Midi_LV2 PRIVATE -mavx2 -mfma)
-            set(_NN_SIMD "avx2+fma")
-        else()
-            set(CMAKE_REQUIRED_FLAGS "-msse4.2")
-            check_cxx_source_runs([[
-                #include <nmmintrin.h>
-                int main() {
-                    __m128i a = _mm_set1_epi32(42);
-                    return (_mm_extract_epi32(a, 0) == 42) ? 0 : 1;
-                }
-            ]] NEURALNOTE_HAVE_SSE42)
-            unset(CMAKE_REQUIRED_FLAGS)
-            if(NEURALNOTE_HAVE_SSE42)
-                target_compile_options(NeuralNoteGuitar2Midi_LV2 PRIVATE -msse4.2)
-                set(_NN_SIMD "sse4.2")
-            endif()
-        endif()
-    endif()
-
-    message(STATUS "LV2 SIMD: ${_NN_SIMD}  (march=${_NN_MARCH})")
-
-    target_compile_options(NeuralNoteGuitar2Midi_LV2 PRIVATE
-        -O2 -ffast-math -fPIC
-        $<$<BOOL:${_NN_MARCH}>:-march=${_NN_MARCH}>
-    )
-
-    # Include paths — LV2/ must come first so BinaryData.h and NoteUtils.h
-    # stubs shadow the JUCE-dependent versions in Lib/Utils and the build dir.
-    target_include_directories(NeuralNoteGuitar2Midi_LV2 PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}/LV2
-        ${CMAKE_CURRENT_LIST_DIR}/Lib/Model
-        ${CMAKE_CURRENT_LIST_DIR}/Lib/Utils
-        ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/RTNeural
-        ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/onnxruntime/include
-    )
-
-    target_compile_definitions(NeuralNoteGuitar2Midi_LV2 PRIVATE
-        SAVE_DOWNSAMPLED_AUDIO=0
-        USE_TEST_NOTE_FRAME_TO_TIME=0
-        NEURALNOTE_SIMD_LEVEL="${_NN_SIMD}"
-    )
-
-    # Link onnxruntime static lib + RTNeural + system LV2
+    # ── Shared dependency discovery ───────────────────────────────────────────
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LV2 REQUIRED lv2)
 
-    # The bundled .a is a macOS universal binary and cannot link on Linux.
-    # Search for the shared library; on aarch64 also check the local staging
-    # directory (ThirdParty/onnxruntime/lib-linux-aarch64/) populated by the
-    # setup step documented in LV2/README.md.
+    # The bundled .a is macOS-only; find a system shared library instead.
+    # On Linux aarch64 stage the pip onnxruntime into
+    # ThirdParty/onnxruntime/lib-linux-aarch64/ per LV2/README.md.
     find_library(LV2_ONNXRUNTIME_LIB
         NAMES onnxruntime
         PATHS
@@ -331,17 +201,90 @@ if(BUILD_LV2)
     endif()
     message(STATUS "LV2: using onnxruntime: ${LV2_ONNXRUNTIME_LIB}")
 
-    target_link_libraries(NeuralNoteGuitar2Midi_LV2 PRIVATE
-        RTNeural
-        ${LV2_ONNXRUNTIME_LIB}
-        ${LV2_LIBRARIES}
-        pthread dl
+    # ── Helper: create one implementation .so ─────────────────────────────────
+    # neuralnote_add_impl(<SUFFIX> <output_name> [<compile_flag> ...])
+    #
+    # Compiles neuralnote_impl.cpp (+ Lib/Model sources) with the given extra
+    # flags and places the resulting .so in the bundle directory.
+    # Each impl exports neuralnote_impl_descriptor() — NOT lv2_descriptor() —
+    # so LV2 hosts cannot accidentally load it directly.
+    function(neuralnote_add_impl SUFFIX OUTPUT_NAME)
+        set(MARCH_FLAGS ${ARGN})
+        add_library(NeuralNoteImpl_${SUFFIX} MODULE
+            ${CMAKE_CURRENT_LIST_DIR}/LV2/neuralnote_impl.cpp
+            ${LIB_MODEL_SOURCES}
+        )
+        set_target_properties(NeuralNoteImpl_${SUFFIX} PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "${OUTPUT_NAME}"
+            LIBRARY_OUTPUT_DIRECTORY "${LV2_BUNDLE_DIR}"
+        )
+        target_compile_features(NeuralNoteImpl_${SUFFIX} PRIVATE cxx_std_17)
+        target_compile_options(NeuralNoteImpl_${SUFFIX} PRIVATE
+            -O3 -ffast-math -fPIC ${MARCH_FLAGS}
+        )
+        target_include_directories(NeuralNoteImpl_${SUFFIX} PRIVATE
+            ${CMAKE_CURRENT_LIST_DIR}/LV2
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Model
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Utils
+            ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/RTNeural
+            ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/onnxruntime/include
+            ${LV2_INCLUDE_DIRS}
+        )
+        target_compile_definitions(NeuralNoteImpl_${SUFFIX} PRIVATE
+            SAVE_DOWNSAMPLED_AUDIO=0
+            USE_TEST_NOTE_FRAME_TO_TIME=0
+            "NEURALNOTE_IMPL_NAME=\"${OUTPUT_NAME}\""
+        )
+        target_link_libraries(NeuralNoteImpl_${SUFFIX} PRIVATE
+            RTNeural
+            ${LV2_ONNXRUNTIME_LIB}
+            ${LV2_LIBRARIES}
+            pthread dl
+        )
+    endfunction()
+
+    # ── Implementation .so files (one per SIMD tier) ──────────────────────────
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        # Pi 4 (Cortex-A72, ARMv8-A): plain NEON
+        neuralnote_add_impl(NEON   "neuralnote_impl_neon"   -march=armv8-a+simd)
+        # Pi 5 (Cortex-A76, ARMv8.2-A): dotprod + fp16
+        neuralnote_add_impl(ARMv82 "neuralnote_impl_armv82" -march=armv8.2-a+dotprod+fp16)
+        message(STATUS "LV2: building aarch64 impls: neon + armv8.2-a+dotprod+fp16")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        neuralnote_add_impl(SSE42  "neuralnote_impl_sse42"  -msse4.2)
+        neuralnote_add_impl(AVX2   "neuralnote_impl_avx2"   -mavx2 -mfma)
+        message(STATUS "LV2: building x86-64 impls: sse4.2 + avx2+fma")
+    else()
+        neuralnote_add_impl(Baseline "neuralnote_impl_baseline")
+        message(STATUS "LV2: building generic baseline impl")
+    endif()
+
+    # ── Wrapper .so (the only target the LV2 host loads) ─────────────────────
+    # Thin dispatcher: reads AT_HWCAP / __builtin_cpu_supports at runtime,
+    # dlopen()s the right impl .so, then delegates via trampolines.
+    # No audio-processing code here — keep it SIMD-flag-free.
+    add_library(NeuralNoteGuitar2Midi_LV2 MODULE
+        ${CMAKE_CURRENT_LIST_DIR}/LV2/neuralnote_guitar2midi.cpp
     )
+    set_target_properties(NeuralNoteGuitar2Midi_LV2 PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "neuralnote_guitar2midi"
+        LIBRARY_OUTPUT_DIRECTORY "${LV2_BUNDLE_DIR}"
+    )
+    target_compile_features(NeuralNoteGuitar2Midi_LV2 PRIVATE cxx_std_17)
+
+    target_compile_options(NeuralNoteGuitar2Midi_LV2 PRIVATE -O2 -fPIC)
     target_include_directories(NeuralNoteGuitar2Midi_LV2 PRIVATE
         ${LV2_INCLUDE_DIRS}
     )
+    target_link_libraries(NeuralNoteGuitar2Midi_LV2 PRIVATE
+        ${LV2_LIBRARIES}
+        dl
+    )
 
-    # Copy TTL files and ModelData into the bundle directory
+    # ── Bundle assembly ───────────────────────────────────────────────────────
+    # TTL files and ModelData are copied on wrapper build completion.
     add_custom_command(TARGET NeuralNoteGuitar2Midi_LV2 POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
             ${CMAKE_CURRENT_LIST_DIR}/LV2/manifest.ttl
