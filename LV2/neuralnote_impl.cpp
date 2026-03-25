@@ -152,6 +152,7 @@ struct NeuralNotePlugin {
     int   ringSize   = static_cast<int>(AUDIO_SAMPLE_RATE * 0.3); // default 300 ms
     int   ringHead   = 0;
     int   ringFilled = 0;
+    int   freshSamples = 0; // resampled samples written since last snapshot was queued
 
     // ── Background inference worker ────────────────────────────────────────
     std::thread             workerThread;
@@ -270,6 +271,7 @@ static void pushToRing(NeuralNotePlugin* self, const float* in, int inLen)
             self->ringHead = (self->ringHead + 1) % rs;
             if (self->ringFilled < rs) ++self->ringFilled;
         }
+        self->freshSamples += inLen;
         return;
     }
     const double ratio  = 22050.0 / self->sampleRate;
@@ -284,6 +286,7 @@ static void pushToRing(NeuralNotePlugin* self, const float* in, int inLen)
         self->ringHead = (self->ringHead + 1) % rs;
         if (self->ringFilled < rs) ++self->ringFilled;
     }
+    self->freshSamples += outLen;
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -414,9 +417,10 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     if (self->windowMs) {
         const int newRingSize = windowMsToRingSize(*self->windowMs);
         if (newRingSize != self->ringSize) {
-            self->ringSize   = newRingSize;
-            self->ringHead   = 0;
-            self->ringFilled = 0;
+            self->ringSize    = newRingSize;
+            self->ringHead    = 0;
+            self->ringFilled  = 0;
+            self->freshSamples = 0;
             memset(self->ringBuf, 0, newRingSize * sizeof(float));
             self->basicPitch->reset();
             std::lock_guard<std::mutex> lk(self->midiMutex);
@@ -454,11 +458,11 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     }
 
     // Hand the latest ring snapshot to the worker (non-blocking).
-    // try_to_lock ensures we never stall the audio thread.
-    // workerHasWork is cleared by the worker the moment it takes the snapshot,
-    // so run() can queue a fresh snapshot while inference is still running.
+    // Rate-limited: only queue when at least ringSize/2 fresh resampled samples
+    // have arrived since the last snapshot, capping inference at 2× per window
+    // period and keeping the worker thread below ~50% CPU.
     const int rs = self->ringSize;
-    if (self->ringFilled >= rs) {
+    if (self->ringFilled >= rs && self->freshSamples >= rs / 2) {
         std::unique_lock<std::mutex> lk(self->workerMutex, std::try_to_lock);
         if (lk.owns_lock() && !self->workerHasWork && !self->workerQuit) {
             self->workerSnapshot.resize(rs);
@@ -466,6 +470,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 self->workerSnapshot[i] =
                     self->ringBuf[(self->ringHead + i) % rs];
             self->workerHasWork = true;
+            self->freshSamples  = 0;
             lk.unlock();
             self->workerCv.notify_one();
         }
