@@ -67,20 +67,29 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// LV2_WINDOW_MS: inference window in ms, set by CMake (default 500).
-// Musical reference: 1/16 note at 120 BPM = 125 ms, at 100 BPM = 150 ms.
-// 500 ms = 4× 1/16 at 120 BPM → ~200 ms avg streaming latency on Pi 4.
-// Override at configure time: cmake -DLV2_WINDOW_MS=1000 ...
-#ifndef LV2_WINDOW_MS
-#define LV2_WINDOW_MS 500
-#endif
+// Ring buffer allocated at the maximum window size (Slow = 1000 ms).
+// The active window is set at runtime by the Mode control port.
+static constexpr int RING_MAX = static_cast<int>(AUDIO_SAMPLE_RATE * 1.0); // 22050
 
-static constexpr int RING_SIZE =
-    static_cast<int>(AUDIO_SAMPLE_RATE * (LV2_WINDOW_MS / 1000.0)); // e.g. 11025 @ 500 ms
+// Map mode port value → ring size in 22050-Hz samples.
+//   0 = Fast   (300 ms)  →  6615  — 4× 1/16 note at 120 BPM
+//   1 = Medium (500 ms)  → 11025  — 4× 1/16 note at 100 BPM  [default]
+//   2 = Slow   (1000 ms) → 22050  — complex chords / slow tempos
+static inline int modeToRingSize(float mode)
+{
+    if (mode < 0.5f) return static_cast<int>(AUDIO_SAMPLE_RATE * 0.3); // 6615
+    if (mode < 1.5f) return static_cast<int>(AUDIO_SAMPLE_RATE * 0.5); // 11025
+    return RING_MAX;                                                      // 22050
+}
 
 // ── Port indices ──────────────────────────────────────────────────────────────
 
-enum PortIndex { PORT_AUDIO_IN = 0, PORT_MIDI_OUT = 1, PORT_THRESHOLD = 2 };
+enum PortIndex {
+    PORT_AUDIO_IN = 0,
+    PORT_MIDI_OUT = 1,
+    PORT_THRESHOLD = 2,
+    PORT_MODE = 3,
+};
 
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
 
@@ -114,6 +123,7 @@ struct NeuralNotePlugin {
     const float*       audioIn;
     LV2_Atom_Sequence* midiOut;
     const float*       threshold;
+    const float*       mode;      // 0=Fast 300ms  1=Medium 500ms  2=Slow 1000ms
 
     // Inference engine — only accessed by the worker thread after init
     std::unique_ptr<BasicPitch> basicPitch;
@@ -125,10 +135,11 @@ struct NeuralNotePlugin {
     std::atomic<float> minNoteLengthMs{50.0f};
 
     // ── Ring buffer (22050-Hz resampled audio, circular) ──────────────────
-    // ringHead: index of the next write slot.
-    //           When the ring is full it also equals the index of the oldest sample.
-    // ringFilled: number of valid samples, capped at RING_SIZE.
-    float ringBuf[RING_SIZE];
+    // Allocated at RING_MAX (1000 ms); ringSize tracks the active window.
+    // ringHead: next write slot (= oldest sample when ring is full).
+    // ringFilled: valid samples, capped at ringSize.
+    float ringBuf[RING_MAX];
+    int   ringSize   = static_cast<int>(AUDIO_SAMPLE_RATE * 0.5); // default Medium
     int   ringHead   = 0;
     int   ringFilled = 0;
 
@@ -221,11 +232,12 @@ static void writeMidi(LV2_Atom_Forge* forge, uint32_t frames,
 // Resample one host audio block to 22050 Hz and push into the ring buffer.
 static void pushToRing(NeuralNotePlugin* self, const float* in, int inLen)
 {
+    const int rs = self->ringSize;
     if (self->sampleRate == 22050.0) {
         for (int i = 0; i < inLen; ++i) {
             self->ringBuf[self->ringHead] = in[i];
-            self->ringHead = (self->ringHead + 1) % RING_SIZE;
-            if (self->ringFilled < RING_SIZE) ++self->ringFilled;
+            self->ringHead = (self->ringHead + 1) % rs;
+            if (self->ringFilled < rs) ++self->ringFilled;
         }
         return;
     }
@@ -238,8 +250,8 @@ static void pushToRing(NeuralNotePlugin* self, const float* in, int inLen)
         const int    s1     = std::min(s0 + 1, inLen - 1);
         self->ringBuf[self->ringHead] =
             static_cast<float>((1.0 - frac) * in[s0] + frac * in[s1]);
-        self->ringHead = (self->ringHead + 1) % RING_SIZE;
-        if (self->ringFilled < RING_SIZE) ++self->ringFilled;
+        self->ringHead = (self->ringHead + 1) % rs;
+        if (self->ringFilled < rs) ++self->ringFilled;
     }
 }
 
@@ -283,7 +295,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
 
     lv2_log_note(&self->logger,
                  "NeuralNote Guitar2MIDI: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
-                 "]  [window: " NEURALNOTE_STRINGIFY(LV2_WINDOW_MS) " ms]\n", rate);
+                 "]  [mode: Fast/Medium/Slow via port 3]\n", rate);
     return static_cast<LV2_Handle>(self);
 }
 
@@ -294,13 +306,14 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
         case PORT_AUDIO_IN:  self->audioIn   = static_cast<const float*>(data);       break;
         case PORT_MIDI_OUT:  self->midiOut   = static_cast<LV2_Atom_Sequence*>(data); break;
         case PORT_THRESHOLD: self->threshold = static_cast<const float*>(data);       break;
+        case PORT_MODE:      self->mode      = static_cast<const float*>(data);       break;
     }
 }
 
 static void activate(LV2_Handle instance)
 {
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
-    // Reset ring buffer
+    // Reset ring buffer (keep current ringSize / mode)
     self->ringHead   = 0;
     self->ringFilled = 0;
     memset(self->ringBuf, 0, sizeof(self->ringBuf));
@@ -343,6 +356,24 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     if (self->threshold)
         self->noteSensitivity.store(*self->threshold, std::memory_order_relaxed);
 
+    // Handle mode changes (Fast / Medium / Slow window size).
+    // When the mode port changes we reset the ring so the worker immediately
+    // starts using the new window length; active notes get note-offs.
+    if (self->mode) {
+        const int newRingSize = modeToRingSize(*self->mode);
+        if (newRingSize != self->ringSize) {
+            self->ringSize   = newRingSize;
+            self->ringHead   = 0;
+            self->ringFilled = 0;
+            memset(self->ringBuf, 0, newRingSize * sizeof(float));
+            self->basicPitch->reset();
+            std::lock_guard<std::mutex> lk(self->midiMutex);
+            for (auto p : self->activeSet)
+                self->pendingMidi.push_back({false, p, 0});
+            self->activeSet.clear();
+        }
+    }
+
     // Resample host block to 22050 Hz and push into circular ring buffer
     pushToRing(self, self->audioIn, static_cast<int>(nSamples));
 
@@ -350,14 +381,14 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     // try_to_lock ensures we never stall the audio thread.
     // workerHasWork is cleared by the worker the moment it takes the snapshot,
     // so run() can queue a fresh snapshot while inference is still running.
-    if (self->ringFilled >= RING_SIZE) {
+    const int rs = self->ringSize;
+    if (self->ringFilled >= rs) {
         std::unique_lock<std::mutex> lk(self->workerMutex, std::try_to_lock);
         if (lk.owns_lock() && !self->workerHasWork && !self->workerQuit) {
-            self->workerSnapshot.resize(RING_SIZE);
-            // Linearise: oldest sample (ringHead) → newest sample
-            for (int i = 0; i < RING_SIZE; ++i)
+            self->workerSnapshot.resize(rs);
+            for (int i = 0; i < rs; ++i)
                 self->workerSnapshot[i] =
-                    self->ringBuf[(self->ringHead + i) % RING_SIZE];
+                    self->ringBuf[(self->ringHead + i) % rs];
             self->workerHasWork = true;
             lk.unlock();
             self->workerCv.notify_one();
