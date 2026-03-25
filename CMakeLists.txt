@@ -336,4 +336,34 @@ if(BUILD_LV2)
         )
         message(STATUS "LV2: latency_bench target enabled")
     endif()
+
+    # ── Terminal notes monitor ─────────────────────────────────────────────────
+    option(BUILD_LV2_MONITOR "Build the terminal notes monitor (requires JACK)" ON)
+    if(BUILD_LV2_MONITOR)
+        find_library(JACK_LIB jack REQUIRED)
+        add_executable(neuralnote_monitor
+            ${CMAKE_CURRENT_LIST_DIR}/LV2/neuralnote_monitor.cpp
+            ${LIB_MODEL_SOURCES}
+        )
+        target_compile_features(neuralnote_monitor PRIVATE cxx_std_17)
+        target_compile_options(neuralnote_monitor PRIVATE -O2 -fPIC)
+        target_include_directories(neuralnote_monitor PRIVATE
+            ${CMAKE_CURRENT_LIST_DIR}/LV2
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Model
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Utils
+            ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/RTNeural
+            ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/onnxruntime/include
+        )
+        target_compile_definitions(neuralnote_monitor PRIVATE
+            SAVE_DOWNSAMPLED_AUDIO=0
+            USE_TEST_NOTE_FRAME_TO_TIME=0
+        )
+        target_link_libraries(neuralnote_monitor PRIVATE
+            RTNeural
+            ${LV2_ONNXRUNTIME_LIB}
+            ${JACK_LIB}
+            pthread dl
+        )
+        message(STATUS "LV2: neuralnote_monitor target enabled")
+    endif()
 endif()

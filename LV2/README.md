@@ -5,11 +5,16 @@ Guitar (or any mono tonal audio) → NeuralNote's BasicPitch engine → MIDI not
 
 ## Ports
 
-| Index | Type | Direction | Description |
-|-------|------|-----------|-------------|
-| 0 | AudioPort | Input | Mono audio in (guitar / instrument) |
-| 1 | AtomPort (MIDI Sequence) | Output | Transcribed MIDI note events |
-| 2 | ControlPort | Input | Onset sensitivity 0.1 – 1.0 (default 0.7) |
+| Index | Symbol | Type | Dir | Default | Description |
+|-------|--------|------|-----|---------|-------------|
+| 0 | `audio_in` | AudioPort | In | — | Mono audio in (guitar / instrument) |
+| 1 | `midi_out` | AtomPort (MIDI Sequence) | Out | — | Transcribed MIDI note events |
+| 2 | `threshold` | ControlPort | In | 0.5 | Note sensitivity 0.1–1.0 (lower = fewer notes, less harmonics) |
+| 3 | `mode` | ControlPort | In | 1 | Latency mode: 0 = Fast 300 ms · 1 = Medium 500 ms · 2 = Slow 1000 ms |
+| 4 | `audio_out` | AudioPort | Out | — | Silent audio through (enables audio-effect classification in Zynthian) |
+| 5 | `gate_floor` | ControlPort | In | 0.003 | Noise gate floor as linear RMS (≈ −50 dBFS); 0 = disabled |
+| 6 | `min_dur` | ControlPort | In | 100 ms | Minimum note duration in ms; filters brief harmonic artefacts |
+| 7 | `amp_floor` | ControlPort | In | 0.65 | Minimum note amplitude 0.0–1.0; filters weak model artefacts |
 
 ---
 
@@ -144,7 +149,12 @@ https://github.com/DamRsn/NeuralNote/guitar2midi
     Name:    NeuralNote Guitar2MIDI
     Port 0:  audio_in   (AudioPort, Input)
     Port 1:  midi_out   (AtomPort, Output)
-    Port 2:  threshold  (ControlPort, Input, default=0.7)
+    Port 2:  threshold  (ControlPort, Input, default=0.5)
+    Port 3:  mode       (ControlPort, Input, default=1)
+    Port 4:  audio_out  (AudioPort, Output)
+    Port 5:  gate_floor (ControlPort, Input, default=0.003)
+    Port 6:  min_dur    (ControlPort, Input, default=100)
+    Port 7:  amp_floor  (ControlPort, Input, default=0.65)
 ```
 
 ### 2. Verify the shared library loads and exports `lv2_descriptor`
@@ -219,23 +229,33 @@ a synthesizer or MIDI recorder. Play and watch notes appear.
 
 ## Architecture overview
 
+The plugin uses a **ring buffer + background worker thread** design to keep `lv2_run()` non-blocking:
+
 ```
-lv2_run()
-  ├─ flush pending MIDI note events → Atom sequence output
-  ├─ update noteSensitivity from control port
-  ├─ resample audio block → 22050 Hz accumulation buffer
-  └─ when buffer ≥ 2 s of audio:
-       ├─ BasicPitch::setParameters(sensitivity, splitSensitivity, minNoteMs)
-       ├─ BasicPitch::transcribeToMIDI(buffer, nSamples)
-       │     ├─ Features (ONNX CQT)  → stacked CQT frames
-       │     └─ BasicPitchCNN (RTNeural) → note/onset/contour posteriorgrams
-       ├─ BasicPitch::getNoteEvents() → Notes::Event vector
-       └─ convert Events → pending {note-on, note-off} pairs
+lv2_run()  (audio thread)
+  ├─ drain pending MIDI events → Atom sequence output
+  ├─ update control ports (threshold, mode, gate_floor, min_dur, amp_floor)
+  ├─ noise gate: compute block RMS; if below gate_floor push zeros into ring
+  ├─ resample audio block to 22050 Hz → circular ring buffer
+  └─ when ring full: try_to_lock → hand snapshot to worker thread
+
+Worker thread  (background)
+  ├─ BasicPitch::setParameters(threshold, 0.5, min_dur)
+  ├─ BasicPitch::transcribeToMIDI(snapshot)
+  │     ├─ Features (ONNX CQT)  → stacked CQT frames
+  │     └─ BasicPitchCNN (RTNeural) → note/onset/contour posteriorgrams
+  ├─ filter events below amp_floor
+  ├─ diff result against active note set → note-on / note-off events
+  └─ append to pendingMidi (picked up by next lv2_run())
 ```
 
-The inference runs **synchronously** in `lv2_run()` every 2 seconds of audio.
-For a future hard-real-time version the 2-second batch can be moved to an
-`lv2:WorkerInterface` thread.
+The ring buffer size is controlled by the `mode` port:
+
+| Mode | Window | Typical latency |
+|------|--------|----------------|
+| 0 — Fast | 300 ms | ~380 ms (Pi 4) / ~200 ms (Pi 5) |
+| 1 — Medium (default) | 500 ms | ~580 ms / ~380 ms |
+| 2 — Slow | 1000 ms | ~1080 ms / ~880 ms |
 
 ---
 
@@ -243,8 +263,11 @@ For a future hard-real-time version the 2-second batch can be moved to an
 
 | File | Purpose |
 |------|---------|
-| `LV2/neuralnote_guitar2midi.cpp` | LV2 plugin entry point |
-| `LV2/BinaryData.h` | File-loading substitute for JUCE BinaryData (loads CNN/ONNX model weights from the bundle's `ModelData/`) |
+| `LV2/neuralnote_guitar2midi.cpp` | LV2 plugin entry point (`lv2_descriptor`) and `dlopen` dispatch |
+| `LV2/neuralnote_impl.cpp` | Plugin implementation (ports, ring buffer, worker thread, MIDI output) |
+| `LV2/neuralnote_monitor.cpp` | Standalone JACK terminal monitor (see below) |
+| `LV2/plugin.ttl` | LV2 metadata — ports, defaults, scale points |
+| `LV2/BinaryData.h` | File-loading substitute for JUCE BinaryData |
 | `LV2/NoteUtils.h` | JUCE-free stub for `Lib/Utils/NoteUtils.h` |
 | `Lib/Model/BasicPitch.{h,cpp}` | Top-level transcription pipeline |
 | `Lib/Model/Features.{h,cpp}` | ONNX CQT feature extraction |
@@ -253,11 +276,65 @@ For a future hard-real-time version the 2-second batch can be moved to an
 
 ---
 
+## Terminal notes monitor
+
+`neuralnote_monitor` is a standalone JACK application that captures audio from
+`system:capture_1`, runs BasicPitch inference in a background thread, and prints
+detected notes to the terminal. Useful for testing without a full LV2 host.
+
+Build alongside the plugin (enabled by default when `BUILD_LV2=ON`):
+
+```bash
+cmake -B build_lv2 -DBUILD_LV2=ON -DBUILD_LV2_MONITOR=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build_lv2 --target neuralnote_monitor -j$(nproc)
+```
+
+Usage:
+
+```
+neuralnote_monitor [--bundle PATH] [--threshold 0.1-1.0] [--gate 0.0-0.1]
+                   [--min-dur MS] [--amp-floor 0.0-1.0] [--mode 0|1|2]
+
+  --bundle PATH      Path to the .lv2 bundle dir containing ModelData/
+  --threshold        Note sensitivity (default 0.5)
+  --gate             Noise gate floor linear RMS (default 0.003 ≈ −50 dBFS)
+  --min-dur          Minimum note duration ms (default 100)
+  --amp-floor        Minimum note amplitude 0–1 (default 0.65)
+  --mode             0=Fast/300ms  1=Medium/500ms  2=Slow/1000ms  (default 1)
+```
+
+Example output:
+
+```
+Time          Event       Note    MIDI#  Vel
+------------  ----------  ------  -----  ---
+[+0.512s]  NOTE ON   E4   ( 64)  vel  91
+[+1.847s]  NOTE OFF  E4   ( 64)
+```
+
+The monitor uses the same defaults as the LV2 plugin for all parameters.
+
+---
+
+## Zynthian integration
+
+The plugin appears in Zynthian's chain UI under **Audio Effect → Other →
+NeuralNote Guitar2MIDI**. The silent `audio_out` port (index 4) is present
+solely so Zynthian's `get_plugin_type()` classifies it as an audio effect.
+
+The `midi_out` JACK port (`NeuralNote_Guitar2MIDI-01:midi_out`) carries the
+transcribed notes. Route it to `ZynMidiRouter:dev*_in` and any synth chain
+listening on the corresponding MIDI channel will receive the notes.
+
+---
+
 ## CMake options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `BUILD_LV2` | `OFF` | Enable the LV2 plugin target |
+| `BUILD_LV2_MONITOR` | `ON` | Build the terminal notes monitor (requires JACK; only when `BUILD_LV2=ON`) |
+| `BUILD_LV2_BENCH` | `ON` | Build the latency benchmark (only when `BUILD_LV2=ON`) |
 | `BUILD_UNIT_TESTS` | `OFF` | Build unit tests |
 | `RTNeural_Release` | `OFF` | Force Release optimisation for RTNeural in Debug builds |
 | `LTO` | `ON` | Link-Time Optimisation |
