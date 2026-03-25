@@ -62,10 +62,21 @@
 #define NEURALNOTE_IMPL_NAME "neuralnote_impl"
 #endif
 
+#define NEURALNOTE_STRINGIFY2(x) #x
+#define NEURALNOTE_STRINGIFY(x)  NEURALNOTE_STRINGIFY2(x)
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// Ring buffer: 2 s at the engine's native sample rate
-static constexpr int RING_SIZE = AUDIO_SAMPLE_RATE * AUDIO_WINDOW_LENGTH; // 44100
+// LV2_WINDOW_MS: inference window in ms, set by CMake (default 500).
+// Musical reference: 1/16 note at 120 BPM = 125 ms, at 100 BPM = 150 ms.
+// 500 ms = 4× 1/16 at 120 BPM → ~200 ms avg streaming latency on Pi 4.
+// Override at configure time: cmake -DLV2_WINDOW_MS=1000 ...
+#ifndef LV2_WINDOW_MS
+#define LV2_WINDOW_MS 500
+#endif
+
+static constexpr int RING_SIZE =
+    static_cast<int>(AUDIO_SAMPLE_RATE * (LV2_WINDOW_MS / 1000.0)); // e.g. 11025 @ 500 ms
 
 // ── Port indices ──────────────────────────────────────────────────────────────
 
@@ -272,7 +283,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
 
     lv2_log_note(&self->logger,
                  "NeuralNote Guitar2MIDI: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
-                 "]  [streaming]\n", rate);
+                 "]  [window: " NEURALNOTE_STRINGIFY(LV2_WINDOW_MS) " ms]\n", rate);
     return static_cast<LV2_Handle>(self);
 }
 

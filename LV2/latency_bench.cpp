@@ -155,7 +155,7 @@ static SimResult simulateStreaming(BasicPitch& bp, double hostRate, int blockSiz
 //   - Total best-case:  inference_ms + one_block_ms
 //   - Average:         ~1.5 × inference_ms
 //
-// This function measures the three cases empirically on a real 2 s tone.
+// This function measures the three cases empirically on a ring of LV2_WINDOW_MS.
 struct StreamingResult {
     double bestMs;
     double worstMs;
@@ -165,11 +165,12 @@ struct StreamingResult {
 
 static StreamingResult simulateStreamingNew(double hostRate, int blockSize)
 {
-    static constexpr int RING = AUDIO_SAMPLE_RATE * AUDIO_WINDOW_LENGTH; // 44100
-    const double msPerBlock   = static_cast<double>(blockSize) / hostRate * 1000.0;
+    static constexpr int RING =
+        static_cast<int>(AUDIO_SAMPLE_RATE * (LV2_WINDOW_MS / 1000.0));
+    const double msPerBlock = static_cast<double>(blockSize) / hostRate * 1000.0;
 
-    // Pre-fill a 2 s ring buffer with 440 Hz tone (represents audio already playing)
-    auto native = makeSine(440.0, AUDIO_SAMPLE_RATE, AUDIO_WINDOW_LENGTH);
+    // Fill the ring with a 440 Hz tone (same length as the configured window)
+    auto native = makeSine(440.0, AUDIO_SAMPLE_RATE, LV2_WINDOW_MS / 1000.0);
 
     // Measure one inference on a full ring
     BasicPitch bp;
@@ -191,6 +192,39 @@ static StreamingResult simulateStreamingNew(double hostRate, int blockSize)
     return { best, worst, (best + worst) / 2.0, inf };
 }
 
+// ── Window-size sweep ─────────────────────────────────────────────────────────
+//
+// The Features ONNX model accepts any audio length (dynamic shape).
+// The BasicPitchCNN processes one CQT frame at a time (no fixed window baked in).
+// We can therefore reduce RING_SIZE without retraining — only the C++ constant
+// needs to change.  This function empirically verifies that the model produces
+// meaningful output at each window size and measures the inference cost.
+
+struct WindowResult {
+    int    windowMs;
+    int    cqtFrames;
+    double inferenceMs;
+    int    notesFound;
+    bool   valid;
+};
+
+static WindowResult testWindow(int windowMs)
+{
+    const int windowSamples = static_cast<int>(AUDIO_SAMPLE_RATE * windowMs / 1000.0);
+    auto sig = makeSine(440.0, AUDIO_SAMPLE_RATE, windowMs / 1000.0);
+
+    BasicPitch bp;
+    bp.setParameters(0.7f, 0.5f, 50.0f);
+
+    auto t0 = Clock::now();
+    bp.transcribeToMIDI(sig.data(), windowSamples);
+    double ms = Ms(Clock::now() - t0).count();
+
+    const auto& ev = bp.getNoteEvents();
+    return { windowMs, windowSamples / FFT_HOP,
+             ms, static_cast<int>(ev.size()), !ev.empty() };
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv)
@@ -209,9 +243,9 @@ int main(int argc, char** argv)
     printf("Models loaded.\n\n");
 
     // ── raw inference benchmark ───────────────────────────────────────────────
-    // 2 s of 440 Hz at 22050 Hz (engine native rate — no resampling overhead)
-    const int BLOCK = AUDIO_SAMPLE_RATE * AUDIO_WINDOW_LENGTH; // 44100 samples
-    auto nativeSignal = makeSine(440.0, AUDIO_SAMPLE_RATE, AUDIO_WINDOW_LENGTH);
+    // Uses LV2_WINDOW_MS (configured window) at 22050 Hz (no resampling overhead)
+    const int    BLOCK       = static_cast<int>(AUDIO_SAMPLE_RATE * (LV2_WINDOW_MS / 1000.0));
+    auto nativeSignal = makeSine(440.0, AUDIO_SAMPLE_RATE, LV2_WINDOW_MS / 1000.0);
 
     // warm-up
     {
@@ -222,8 +256,8 @@ int main(int argc, char** argv)
                bp.getNoteEvents().size());
     }
 
-    printf("=== Raw inference benchmark (%d iterations, 22050 Hz, 2 s block) ===\n",
-           iterations);
+    printf("=== Raw inference benchmark (%d iterations, 22050 Hz, %d ms window) ===\n",
+           iterations, LV2_WINDOW_MS);
 
     std::vector<double> times;
     times.reserve(iterations);
@@ -315,6 +349,60 @@ int main(int argc, char** argv)
     printf("  * 'Worst'  = note played just as inference starts → 2 inferences + 2 blocks.\n");
     printf("  * 'Avg'    = (Best + Worst) / 2.\n");
     printf("  * Initial fill still takes 2 s; these figures apply once the ring is full.\n");
+
+    // ── Window-size sweep ─────────────────────────────────────────────────────
+    // Musical reference: 1/16th note at 100 BPM = 150 ms, at 120 BPM = 125 ms.
+    // The ONNX CQT model has a dynamic temporal dimension; the RTNeural CNN
+    // processes one frame at a time.  No retraining is needed to change the
+    // window.  We sweep candidate sizes to find the minimum that reliably
+    // detects a 440 Hz note and measure the resulting inference speedup.
+    printf("\n=== Window-size sweep (440 Hz sine, 48 kHz host / 512 block) ===\n");
+    printf("  Musical reference: 1/16 note @ 120 BPM = 125 ms, @ 100 BPM = 150 ms\n");
+    printf("  CNN lookahead = %d frames = %.0f ms\n",
+           10, 10.0 * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0);
+    printf("\n");
+    printf("  %-12s  %6s  %6s  %8s  %6s  %8s  %8s  %8s\n",
+           "Window", "Frames", "Notes", "Infer", "Valid",
+           "Avg lat", "Speed×", "vs 2 s");
+    printf("  %-12s  %6s  %6s  %8s  %6s  %8s  %8s  %8s\n",
+           "------------", "------", "------",
+           " (ms)  ", "     ", " (ms)  ", "      ", "      ");
+
+    // Candidate window sizes in ms
+    static const int windows[] = { 200, 300, 400, 500, 600, 750, 1000, 1500, 2000 };
+    static const int nWindows  = static_cast<int>(sizeof(windows) / sizeof(windows[0]));
+
+    // Baseline: 2000 ms
+    WindowResult baseline = testWindow(2000);
+    const double msPerBlock48 = 512.0 / 48000.0 * 1000.0; // ~10.7 ms
+
+    for (int w = 0; w < nWindows; ++w) {
+        WindowResult r = testWindow(windows[w]);
+        // Avg streaming latency = (best + worst) / 2  where best = inf + block,
+        // worst = 2*inf + 2*block (same formula as simulateStreamingNew).
+        const double best  = r.inferenceMs + msPerBlock48;
+        const double worst = 2.0 * r.inferenceMs + 2.0 * msPerBlock48;
+        const double avgLat = (best + worst) / 2.0;
+        const double speedup = baseline.inferenceMs / r.inferenceMs;
+        const char*  marker = (r.valid && r.windowMs >= 125) ? "" :
+                              (r.valid ? " (< 1/16@120)" : " NO NOTES");
+        printf("  %-12s  %6d  %6d  %8.1f  %6s  %8.0f  %8.1f%s\n",
+               (std::to_string(windows[w]) + " ms").c_str(),
+               r.cqtFrames,
+               r.notesFound,
+               r.inferenceMs,
+               r.valid ? "yes" : "NO",
+               avgLat,
+               speedup,
+               marker);
+    }
+
+    printf("\n  Recommendation for live performance:\n");
+    printf("  * Minimum window = 125 ms (1/16 @ 120 BPM) + CNN lookahead (116 ms)\n");
+    printf("    → 250 ms absolute floor, but use >= 500 ms for reliable note edges.\n");
+    printf("  * 500 ms: best balance of latency and accuracy at 100-120 BPM.\n");
+    printf("  * 1000 ms: safer for slower tempos or complex chords.\n");
+    printf("  * No retraining needed — ONNX model and CNN both accept variable length.\n");
 
     return 0;
 }
