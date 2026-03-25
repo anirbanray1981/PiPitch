@@ -13,8 +13,8 @@
  *   --gate FLOAT       Noise gate floor as linear RMS 0.0-0.1  (default 0.003 ≈ -50 dBFS)
  *                      Blocks below this level are treated as silence; set 0 to disable
  *   --min-dur MS       Minimum note duration in ms  (default 100; higher = fewer harmonics)
- *   --amp-floor FLOAT  Minimum note amplitude 0.0-1.0  (default 0.15; filters weak artifacts)
- *   --mode INT         0=Fast/300ms  1=Medium/500ms  2=Slow/1000ms  (default 1)
+ *   --amp-floor FLOAT  Minimum note amplitude 0.0-1.0  (default 0.65; filters weak artifacts)
+ *   --window MS        Inference window 50-2000 ms  (default 300)
  *
  * Output format (one line per event):
  *   [+0.123s]  NOTE ON   A4  (69)
@@ -46,14 +46,13 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-static constexpr double PLUGIN_SR   = 22050.0;   // BasicPitch native rate
-static constexpr int    RING_MAX    = static_cast<int>(PLUGIN_SR * 1.0); // 1 s max
+static constexpr double PLUGIN_SR = 22050.0;           // BasicPitch native rate
+static constexpr int    RING_MAX  = static_cast<int>(PLUGIN_SR * 2.0); // 2 s max
 
-static int modeToRingSize(int mode)
+static int windowMsToRingSize(float ms)
 {
-    if (mode == 0) return static_cast<int>(PLUGIN_SR * 0.3); // Fast   300 ms
-    if (mode == 1) return static_cast<int>(PLUGIN_SR * 0.5); // Medium 500 ms
-    return RING_MAX;                                          // Slow  1000 ms
+    const float clamped = std::clamp(ms, 50.0f, 2000.0f);
+    return std::min(static_cast<int>(clamped / 1000.0f * PLUGIN_SR), RING_MAX);
 }
 
 // ── Note name helpers ─────────────────────────────────────────────────────────
@@ -99,7 +98,7 @@ struct Monitor {
     float    gateFloor    = 0.003f;  // RMS below this → silence (≈ -50 dBFS)
     float    minDurMs     = 100.0f;  // min note duration in ms (filters brief harmonic flickers)
     float    ampFloor     = 0.65f;   // min note amplitude 0.0-1.0 (filters weak harmonic artifacts)
-    int      ringSize     = modeToRingSize(1);
+    int      ringSize     = windowMsToRingSize(300.0f);
 
     // --- ring buffer (written by JACK process callback) ---
     float    ring[RING_MAX] = {};
@@ -272,7 +271,7 @@ int main(int argc, char** argv)
     float gateFloor = 0.003f;   // RMS below this → silence (≈ -50 dBFS); 0 = disabled
     float minDurMs  = 100.0f;   // min note duration in ms; filters brief harmonic flickers
     float ampFloor  = 0.65f;    // min note amplitude 0.0-1.0; filters weak harmonic artifacts
-    int   mode      = 1;
+    float windowMs  = 300.0f;   // inference window in ms (50-2000)
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bundle") == 0 && i + 1 < argc)
@@ -285,11 +284,11 @@ int main(int argc, char** argv)
             minDurMs = std::stof(argv[++i]);
         else if (std::strcmp(argv[i], "--amp-floor") == 0 && i + 1 < argc)
             ampFloor = std::stof(argv[++i]);
-        else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
-            mode = std::stoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--window") == 0 && i + 1 < argc)
+            windowMs = std::stof(argv[++i]);
         else {
             std::fprintf(stderr,
-                "Usage: %s [--bundle PATH] [--threshold 0.1-1.0] [--gate 0.0-0.1] [--min-dur MS] [--amp-floor 0.0-1.0] [--mode 0|1|2]\n",
+                "Usage: %s [--bundle PATH] [--threshold 0.1-1.0] [--gate 0.0-0.1] [--min-dur MS] [--amp-floor 0.0-1.0] [--window MS]\n",
                 argv[0]);
             return 1;
         }
@@ -332,8 +331,7 @@ int main(int argc, char** argv)
                 gateFloor == 0.0f ? "  [disabled]" : "");
     std::printf("MinDur:    %.0f ms\n", minDurMs);
     std::printf("AmpFloor:  %.2f\n", ampFloor);
-    std::printf("Mode:      %d (%s)\n", mode,
-                mode == 0 ? "Fast/300ms" : mode == 1 ? "Medium/500ms" : "Slow/1000ms");
+    std::printf("Window:    %.0f ms\n", windowMs);
 
     // --- load models ---
     try {
@@ -349,7 +347,7 @@ int main(int argc, char** argv)
     mon.gateFloor = gateFloor;
     mon.minDurMs  = minDurMs;
     mon.ampFloor  = ampFloor;
-    mon.ringSize  = modeToRingSize(mode);
+    mon.ringSize  = windowMsToRingSize(windowMs);
     mon.bp        = std::make_unique<BasicPitch>();
     mon.startTime = std::chrono::steady_clock::now();
     g_mon         = &mon;

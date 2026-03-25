@@ -68,19 +68,14 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// Ring buffer allocated at the maximum window size (Slow = 1000 ms).
-// The active window is set at runtime by the Mode control port.
-static constexpr int RING_MAX = static_cast<int>(AUDIO_SAMPLE_RATE * 1.0); // 22050
+// Ring buffer allocated at maximum window size (2000 ms).
+static constexpr int RING_MAX = static_cast<int>(AUDIO_SAMPLE_RATE * 2.0); // 44100
 
-// Map mode port value → ring size in 22050-Hz samples.
-//   0 = Fast   (300 ms)  →  6615  — 4× 1/16 note at 120 BPM
-//   1 = Medium (500 ms)  → 11025  — 4× 1/16 note at 100 BPM  [default]
-//   2 = Slow   (1000 ms) → 22050  — complex chords / slow tempos
-static inline int modeToRingSize(float mode)
+// Convert window_ms control port value → ring size in 22050-Hz samples.
+static inline int windowMsToRingSize(float ms)
 {
-    if (mode < 0.5f) return static_cast<int>(AUDIO_SAMPLE_RATE * 0.3); // 6615
-    if (mode < 1.5f) return static_cast<int>(AUDIO_SAMPLE_RATE * 0.5); // 11025
-    return RING_MAX;                                                      // 22050
+    const float clamped = std::clamp(ms, 50.0f, 2000.0f);
+    return std::min(static_cast<int>(clamped / 1000.0f * AUDIO_SAMPLE_RATE), RING_MAX);
 }
 
 // ── Port indices ──────────────────────────────────────────────────────────────
@@ -129,7 +124,7 @@ struct NeuralNotePlugin {
     float*             audioOut;
     LV2_Atom_Sequence* midiOut;
     const float*       threshold;
-    const float*       mode;      // 0=Fast 300ms  1=Medium 500ms  2=Slow 1000ms
+    const float*       windowMs;  // inference window 50–2000 ms (default 300)
     const float*       gate;      // noise gate floor (linear RMS, default 0.003 ≈ -50 dBFS)
     const float*       minDur;    // minimum note duration in ms (default 100)
     const float*       ampFloor;  // minimum note amplitude 0.0-1.0 (default 0.65)
@@ -144,12 +139,17 @@ struct NeuralNotePlugin {
     std::atomic<float> minNoteLengthMs{100.0f};
     std::atomic<float> ampFloorVal{0.65f};
 
+    // Last-seen parameter values — used by run() to detect changes
+    float lastThreshold{0.5f};
+    float lastMinDur{100.0f};
+    float lastAmpFloor{0.65f};
+
     // ── Ring buffer (22050-Hz resampled audio, circular) ──────────────────
-    // Allocated at RING_MAX (1000 ms); ringSize tracks the active window.
+    // Allocated at RING_MAX (2000 ms); ringSize tracks the active window.
     // ringHead: next write slot (= oldest sample when ring is full).
     // ringFilled: valid samples, capped at ringSize.
     float ringBuf[RING_MAX];
-    int   ringSize   = static_cast<int>(AUDIO_SAMPLE_RATE * 0.5); // default Medium
+    int   ringSize   = static_cast<int>(AUDIO_SAMPLE_RATE * 0.3); // default 300 ms
     int   ringHead   = 0;
     int   ringFilled = 0;
 
@@ -157,8 +157,9 @@ struct NeuralNotePlugin {
     std::thread             workerThread;
     std::mutex              workerMutex;
     std::condition_variable workerCv;
-    bool                    workerHasWork = false;
-    bool                    workerQuit    = false;
+    bool                    workerHasWork    = false;
+    bool                    workerQuit       = false;
+    std::atomic<bool>       workerParamsChanged{false}; // re-eval current audio with new params
     std::vector<float>      workerSnapshot; // ring linearised for the worker
 
     // ── Pending MIDI (worker → run()) ─────────────────────────────────────
@@ -170,57 +171,75 @@ struct NeuralNotePlugin {
 
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
+// Helper: build note set from inference results and diff against activeSet.
+static void applyInferenceResult(NeuralNotePlugin* self)
+{
+    const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
+    std::set<uint8_t>          newSet;
+    std::map<uint8_t, uint8_t> velMap;
+    for (const auto& ev : self->basicPitch->getNoteEvents()) {
+        if (static_cast<float>(ev.amplitude) < ampFloor) continue;
+        const auto p = static_cast<uint8_t>(std::clamp(ev.pitch, 0, 127));
+        const auto v = static_cast<uint8_t>(
+            std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127));
+        newSet.insert(p);
+        auto it = velMap.find(p);
+        if (it == velMap.end() || v > it->second)
+            velMap[p] = v;
+    }
+    std::lock_guard<std::mutex> lk(self->midiMutex);
+    for (auto p : newSet)
+        if (!self->activeSet.count(p))
+            self->pendingMidi.push_back({true, p, velMap[p]});
+    for (auto p : self->activeSet)
+        if (!newSet.count(p))
+            self->pendingMidi.push_back({false, p, 0});
+    self->activeSet = std::move(newSet);
+}
+
 static void runWorker(NeuralNotePlugin* self)
 {
-    std::vector<float> snap;
+    bool hasPriorResult = false; // true once transcribeToMIDI has run at least once
 
     while (true) {
-        // Wait for a snapshot to process
+        std::vector<float> snap;
+        bool hasNewSnap     = false;
+        bool paramsChanged  = false;
+
         {
             std::unique_lock<std::mutex> lk(self->workerMutex);
             self->workerCv.wait(lk, [self]{
-                return self->workerHasWork || self->workerQuit;
+                return self->workerHasWork
+                    || self->workerQuit
+                    || self->workerParamsChanged.load(std::memory_order_relaxed);
             });
             if (self->workerQuit) break;
-            snap = std::move(self->workerSnapshot);
-            // Clear the flag *before* releasing the lock so run() can
-            // queue the next snapshot while this inference is still running.
-            self->workerHasWork = false;
+            if (self->workerHasWork) {
+                snap = std::move(self->workerSnapshot);
+                self->workerHasWork = false;
+                hasNewSnap = true;
+            }
+            paramsChanged = self->workerParamsChanged.exchange(false, std::memory_order_relaxed);
         }
 
-        // Inference — no lock held; this is the slow part (~380 ms on Pi 4)
+        // Always apply latest parameters before any inference or re-evaluation
         self->basicPitch->setParameters(
             self->noteSensitivity.load(std::memory_order_relaxed),
             self->splitSensitivity.load(std::memory_order_relaxed),
             self->minNoteLengthMs.load(std::memory_order_relaxed));
-        self->basicPitch->transcribeToMIDI(snap.data(), static_cast<int>(snap.size()));
 
-        // Build pitch set from inference result, filtering by amplitude floor
-        const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
-        std::set<uint8_t>          newSet;
-        std::map<uint8_t, uint8_t> velMap;
-        for (const auto& ev : self->basicPitch->getNoteEvents()) {
-            if (static_cast<float>(ev.amplitude) < ampFloor) continue;
-            const auto p = static_cast<uint8_t>(std::clamp(ev.pitch, 0, 127));
-            const auto v = static_cast<uint8_t>(
-                std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127));
-            newSet.insert(p);
-            auto it = velMap.find(p);
-            if (it == velMap.end() || v > it->second)
-                velMap[p] = v;
+        if (hasNewSnap) {
+            // Full inference on new audio window (~380 ms on Pi 4)
+            self->basicPitch->transcribeToMIDI(snap.data(), static_cast<int>(snap.size()));
+            hasPriorResult = true;
+        } else if (paramsChanged && hasPriorResult) {
+            // Re-evaluate stored posteriorgrams with new params — fast, no CNN re-run
+            self->basicPitch->updateMIDI();
+        } else {
+            continue;
         }
 
-        // Diff against activeSet → note-on / note-off events
-        {
-            std::lock_guard<std::mutex> lk(self->midiMutex);
-            for (auto p : newSet)
-                if (!self->activeSet.count(p))
-                    self->pendingMidi.push_back({true, p, velMap[p]});
-            for (auto p : self->activeSet)
-                if (!newSet.count(p))
-                    self->pendingMidi.push_back({false, p, 0});
-            self->activeSet = std::move(newSet);
-        }
+        applyInferenceResult(self);
     }
 
     // Shutdown: release every active note
@@ -298,7 +317,8 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     }
 
     self->basicPitch = std::make_unique<BasicPitch>();
-    self->basicPitch->setParameters(0.5f, 0.5f, 100.0f); // threshold, split, minDurMs
+    self->basicPitch->setParameters(0.5f, 0.5f, 100.0f);
+    self->ringSize = windowMsToRingSize(300.0f); // default 300 ms window
 
     memset(self->ringBuf, 0, sizeof(self->ringBuf));
 
@@ -319,7 +339,7 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
         case PORT_AUDIO_OUT: self->audioOut  = static_cast<float*>(data);             break;
         case PORT_MIDI_OUT:  self->midiOut   = static_cast<LV2_Atom_Sequence*>(data); break;
         case PORT_THRESHOLD: self->threshold = static_cast<const float*>(data);       break;
-        case PORT_MODE:      self->mode      = static_cast<const float*>(data);       break;
+        case PORT_MODE:      self->windowMs  = static_cast<const float*>(data);       break;
         case PORT_GATE:      self->gate      = static_cast<const float*>(data);       break;
         case PORT_MIN_DUR:   self->minDur    = static_cast<const float*>(data);       break;
         case PORT_AMP_FLOOR: self->ampFloor  = static_cast<const float*>(data);       break;
@@ -368,19 +388,31 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         self->pendingMidi.clear();
     }
 
-    // Update parameters from control ports
-    if (self->threshold)
-        self->noteSensitivity.store(*self->threshold, std::memory_order_relaxed);
-    if (self->minDur)
-        self->minNoteLengthMs.store(*self->minDur, std::memory_order_relaxed);
-    if (self->ampFloor)
-        self->ampFloorVal.store(*self->ampFloor, std::memory_order_relaxed);
+    // Update parameters from control ports; notify worker if any changed.
+    bool paramsChanged = false;
+    if (self->threshold) {
+        const float v = *self->threshold;
+        if (v != self->lastThreshold) { self->lastThreshold = v; paramsChanged = true; }
+        self->noteSensitivity.store(v, std::memory_order_relaxed);
+    }
+    if (self->minDur) {
+        const float v = *self->minDur;
+        if (v != self->lastMinDur) { self->lastMinDur = v; paramsChanged = true; }
+        self->minNoteLengthMs.store(v, std::memory_order_relaxed);
+    }
+    if (self->ampFloor) {
+        const float v = *self->ampFloor;
+        if (v != self->lastAmpFloor) { self->lastAmpFloor = v; paramsChanged = true; }
+        self->ampFloorVal.store(v, std::memory_order_relaxed);
+    }
+    if (paramsChanged) {
+        self->workerParamsChanged.store(true, std::memory_order_relaxed);
+        self->workerCv.notify_one();
+    }
 
-    // Handle mode changes (Fast / Medium / Slow window size).
-    // When the mode port changes we reset the ring so the worker immediately
-    // starts using the new window length; active notes get note-offs.
-    if (self->mode) {
-        const int newRingSize = modeToRingSize(*self->mode);
+    // Handle window size changes — reset ring so new length takes effect immediately.
+    if (self->windowMs) {
+        const int newRingSize = windowMsToRingSize(*self->windowMs);
         if (newRingSize != self->ringSize) {
             self->ringSize   = newRingSize;
             self->ringHead   = 0;
