@@ -173,6 +173,13 @@ endif ()
 # ── LV2 Plugin target ────────────────────────────────────────────────────────
 option(BUILD_LV2 "Build LV2 plugin" OFF)
 
+# Inference window fed to BasicPitch (ms). Smaller = lower latency.
+# Musical guide: 1/16 note at 120 BPM = 125 ms; at 100 BPM = 150 ms.
+# 500 ms fits 4× 1/16 at 120 BPM → ~200 ms avg streaming latency on Pi 4.
+# 1000 ms is safer for complex chords or slower tempos.
+# No retraining needed — the ONNX CQT model accepts dynamic input length.
+set(LV2_WINDOW_MS 500 CACHE STRING "Inference window length in ms (default 500)")
+
 if(BUILD_LV2)
     set(LV2_BUNDLE_NAME "neuralnote_guitar2midi.lv2")
     set(LV2_BUNDLE_DIR  "${CMAKE_BINARY_DIR}/${LV2_BUNDLE_NAME}")
@@ -235,6 +242,7 @@ if(BUILD_LV2)
             SAVE_DOWNSAMPLED_AUDIO=0
             USE_TEST_NOTE_FRAME_TO_TIME=0
             "NEURALNOTE_IMPL_NAME=\"${OUTPUT_NAME}\""
+            "LV2_WINDOW_MS=${LV2_WINDOW_MS}"
         )
         target_link_libraries(NeuralNoteImpl_${SUFFIX} PRIVATE
             RTNeural
@@ -299,4 +307,33 @@ if(BUILD_LV2)
     )
 
     message(STATUS "LV2 bundle will be assembled at: ${LV2_BUNDLE_DIR}")
+
+    # ── Latency benchmark ─────────────────────────────────────────────────────
+    option(BUILD_LV2_BENCH "Build the Guitar2MIDI latency benchmark" ON)
+    if(BUILD_LV2_BENCH)
+        add_executable(latency_bench
+            ${CMAKE_CURRENT_LIST_DIR}/LV2/latency_bench.cpp
+            ${LIB_MODEL_SOURCES}
+        )
+        target_compile_features(latency_bench PRIVATE cxx_std_17)
+        target_compile_options(latency_bench PRIVATE -O2 -fPIC)
+        target_include_directories(latency_bench PRIVATE
+            ${CMAKE_CURRENT_LIST_DIR}/LV2
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Model
+            ${CMAKE_CURRENT_LIST_DIR}/Lib/Utils
+            ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/RTNeural
+            ${CMAKE_CURRENT_LIST_DIR}/ThirdParty/onnxruntime/include
+        )
+        target_compile_definitions(latency_bench PRIVATE
+            SAVE_DOWNSAMPLED_AUDIO=0
+            USE_TEST_NOTE_FRAME_TO_TIME=0
+            "LV2_WINDOW_MS=${LV2_WINDOW_MS}"
+        )
+        target_link_libraries(latency_bench PRIVATE
+            RTNeural
+            ${LV2_ONNXRUNTIME_LIB}
+            pthread dl
+        )
+        message(STATUS "LV2: latency_bench target enabled")
+    endif()
 endif()
