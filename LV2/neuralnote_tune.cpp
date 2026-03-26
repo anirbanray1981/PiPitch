@@ -47,6 +47,7 @@
 #include "BasicPitch.h"
 #include "BasicPitchConstants.h"
 #include "NoteRangeConfig.h"
+#include "OneBitPitchDetector.h"
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -124,7 +125,9 @@ struct PendingNote { bool noteOn; int pitch; float velocity; };
 
 struct SnapshotChannel {
     std::vector<float> data;
-    int                snapshotSize = 0;
+    int                snapshotSize       = 0;
+    int                provNoteAtDispatch = -1;
+    double             provOnMs           = 0.0;  // ms since startTime when provisional fired
     std::atomic<bool>  ready{false};
     std::atomic<bool>  quit{false};
     sem_t              sem;
@@ -180,6 +183,17 @@ struct RangeState {
     std::set<int>      activeNotes;
     std::map<int, int> noteHold;
 
+    OneBitPitchDetector obd;
+    std::atomic<int>    provNote{-1};   // set by jackProcess, cleared by worker
+    int                 provMidiPitch = -1;  // within-callback: consumed by processSynth
+    double              provOnTimeMs  = 0.0; // set by processSynth, copied to snapChan at dispatch
+    double              obdMinHoldMs  = 0.0; // min ms before CNN may cancel an OBP provisional
+
+    // OBP onset gate and voting buffer
+    bool            obdOnsetActive  = false;
+    int             obdWindowRemain = 0;    // samples remaining in OBP window; expires after 100 ms
+    OBPVotingBuffer obdVoting;
+
     std::thread workerThread;
 
     RangeState()                           = default;
@@ -212,6 +226,10 @@ struct Monitor {
     // Onset detector state (jackProcess thread only)
     float onsetSmoothedRms = 0.001f;
     int   onsetBlankRemain = 0;      // raw input samples remaining in blank period
+
+    // Per-range OBP provisional note fired this onset (-1 if none); cleared on each onset.
+    // Used for cross-range harmonic suppression.
+    std::array<int, 8> onsetProvNotes = {-1,-1,-1,-1,-1,-1,-1,-1};
 };
 
 static Monitor*          g_mon = nullptr;
@@ -221,16 +239,59 @@ static void onSignal(int) { g_quit.store(true); }
 // ── Worker thread (one per range) ──────────────────────────────────────────────
 
 static void applyRangeDiff(Monitor* m, RangeState& r,
-                           const std::map<int, int>& newNotes, double inferMs)
+                           const std::map<int, int>& newNotesCNN, double inferMs, int prov)
 {
-    const double elapsed = std::chrono::duration<double>(
+    const double elapsed   = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - m->startTime).count();
+    const double elapsedMs = elapsed * 1000.0;
+
+    // If CNN wants to cancel a provisional but the minimum hold hasn't elapsed,
+    // keep the provisional alive by treating it as confirmed for this pass.
+    // This prevents double-fire glitches when onset-forced dispatch runs on stale audio.
+    const bool holdElapsed = (elapsedMs - r.snapChan.provOnMs) >= r.obdMinHoldMs;
+    const std::map<int, int>* pNewNotes = &newNotesCNN;
+    std::map<int, int> heldNotes;
+    if (prov != -1 && newNotesCNN.empty() && !holdElapsed) {
+        heldNotes[prov] = 80;   // keep provisional as if confirmed
+        pNewNotes = &heldNotes;
+    }
+    const std::map<int, int>& newNotes = *pNewNotes;
+
+    // Log CNN outcome relative to any provisional OBP note
+    if (prov != -1) {
+        if (newNotes.count(prov)) {
+            if (pNewNotes == &heldNotes) {
+                std::printf("[+%.3fs]  --   OBP hold  %-4s (%3d)"
+                            "  [%.0f/%.0f ms  range %s]\n",
+                            elapsed, midiToName(prov).c_str(), prov,
+                            elapsedMs - r.snapChan.provOnMs, r.obdMinHoldMs,
+                            r.cfg.name.c_str());
+            } else {
+                std::printf("[+%.3fs]  --   CNN confirmed OBP %-4s (%3d)"
+                            "  [inf %4.0fms  range %s]\n",
+                            elapsed, midiToName(prov).c_str(), prov,
+                            inferMs, r.cfg.name.c_str());
+            }
+        } else if (!newNotes.empty()) {
+            std::printf("[+%.3fs]  --   CNN corrected OBP %-4s (%3d) →",
+                        elapsed, midiToName(prov).c_str(), prov);
+            for (const auto& [p, v] : newNotes)
+                std::printf("  %-4s (%3d)", midiToName(p).c_str(), p);
+            std::printf("  [inf %4.0fms  range %s]\n", inferMs, r.cfg.name.c_str());
+        } else {
+            std::printf("[+%.3fs]  --   CNN cancelled OBP %-4s (%3d)"
+                        "  [inf %4.0fms  range %s]\n",
+                        elapsed, midiToName(prov).c_str(), prov,
+                        inferMs, r.cfg.name.c_str());
+        }
+        std::fflush(stdout);
+    }
 
     for (const auto& [p, v] : newNotes) {
         r.noteHold.erase(p);
         if (!r.activeNotes.count(p)) {
             std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d"
-                        "  [win %4.0fms  inf %4.0fms  range %s]\n",
+                        "  [CNN  win %4.0fms  inf %4.0fms  range %s]\n",
                         elapsed, midiToName(p).c_str(), p, v,
                         r.cfg.windowMs, inferMs, r.cfg.name.c_str());
             std::fflush(stdout);
@@ -281,6 +342,14 @@ static void runWorkerForRange(Monitor* m, RangeState* r)
         const double inferMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
 
+        // Two-phase: insert provisional OneBitPitch note before diff
+        const int prov = r->snapChan.provNoteAtDispatch;
+        if (prov != -1) {
+            r->activeNotes.insert(prov);
+            r->snapChan.provNoteAtDispatch = -1;
+            r->provNote.store(-1, std::memory_order_release);
+        }
+
         std::map<int, int> newNotes;
         for (const auto& ev : r->bp->getNoteEvents()) {
             if (static_cast<float>(ev.amplitude) < m->ampFloor) continue;
@@ -291,7 +360,7 @@ static void runWorkerForRange(Monitor* m, RangeState* r)
             if (it == newNotes.end() || v > it->second) newNotes[p] = v;
         }
 
-        applyRangeDiff(m, *r, newNotes, inferMs);
+        applyRangeDiff(m, *r, newNotes, inferMs, prov);
     }
 
     // Shutdown: release all active notes
@@ -310,6 +379,67 @@ static void runWorkerForRange(Monitor* m, RangeState* r)
 
 static void processSynth(Monitor* m, float* out, int nFrames)
 {
+    // Handle provisional OneBitPitch note-ONs with cross-range harmonic suppression.
+    // Rule: when range[i] fires note P, suppress range[j] if it already fired P+12/24
+    // (our note is its harmonic) or |P_j - P| ≤ 1 (adjacent-note interference).
+    // Retroactively kill the synth voice for already-playing wrong-range provisionals.
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - m->startTime).count();
+    const int nRanges = static_cast<int>(m->ranges.size());
+    for (int ri = 0; ri < nRanges; ++ri) {
+        RangeState& rp = *m->ranges[ri];
+        const int pp = rp.provMidiPitch;
+        if (pp == -1) continue;
+        rp.provMidiPitch = -1;
+
+        // Check if a lower range already fired something this onset that makes this one
+        // a harmonic (diff 12 or 24) or an adjacent-frequency artefact (diff ≤ 1).
+        bool suppressed = false;
+        for (int j = 0; j < ri && !suppressed; ++j) {
+            const int pj = m->onsetProvNotes[j];
+            if (pj == -1) continue;
+            const int diff = pp - pj;
+            if (diff == 12 || diff == 24 || std::abs(diff) <= 5)
+                suppressed = true;
+        }
+        if (suppressed) {
+            rp.obdOnsetActive = false;  // don't retry for this onset
+            continue;
+        }
+
+        // Record this provisional; retroactively silence any higher-range voice that
+        // fired a harmonic or adjacent note earlier in this onset window.
+        if (ri < (int)m->onsetProvNotes.size())
+            m->onsetProvNotes[ri] = pp;
+        for (int j = ri + 1; j < nRanges; ++j) {
+            const int pj = (j < (int)m->onsetProvNotes.size()) ? m->onsetProvNotes[j] : -1;
+            if (pj == -1) continue;
+            const int diff = pj - pp;
+            if (diff == 12 || diff == 24 || std::abs(diff) <= 5) {
+                // Start release on the voice that was playing the wrong provisional
+                for (auto& v : m->voices)
+                    if (v.pitch == pj && v.state != 0 && v.state != 3)
+                        v.state = 3;
+                m->onsetProvNotes[j] = -1;
+                m->ranges[j]->obdOnsetActive = false;
+            }
+        }
+
+        rp.provOnTimeMs = elapsed * 1000.0;  // ms since startTime
+        std::printf("[+%.3fs]  ON   %-4s (%3d)  vel 100"
+                    "  [1-bit provisional  range %s]\n",
+                    elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
+        std::fflush(stdout);
+        int   best      = 0;
+        float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (m->voices[i].state == 0) { best = i; break; }
+            const float l = m->voices[i].envLevel;
+            if (l < bestLevel) { bestLevel = l; best = i; }
+        }
+        m->voices[best] = { pp, midiToFreq(pp), 0.0, 100.0f / 127.0f, 1, 0.0f };
+    }
+
     // Drain all ranges' MIDI output queues — lockless
     for (auto& rp : m->ranges) {
         PendingNote pn;
@@ -375,6 +505,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         onsetFired            = true;
         m->onsetBlankRemain   = static_cast<int>(m->sampleRate * (ONSET_BLANK_MS / 1000.0f));
         m->onsetSmoothedRms   = blockRms;
+        m->onsetProvNotes.fill(-1);  // new onset: reset cross-range provisional tracking
     }
     if (!onsetFired && m->onsetBlankRemain == 0)
         m->onsetSmoothedRms = m->onsetSmoothedRms * (1.0f - ONSET_ALPHA) + blockRms * ONSET_ALPHA;
@@ -396,6 +527,55 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         }
         r.freshSamples += static_cast<int>(resampled.size());
 
+        // Two-phase OneBitPitch: arm on onset, expire after 100 ms.
+        // Voting buffer requires 9/12 consistent readings before firing provisional.
+        if (onsetFired) {
+            r.obdOnsetActive  = true;
+            r.obdWindowRemain = static_cast<int>(m->sampleRate * 0.1f);
+            r.obdVoting.reset();
+            r.obd.reset();
+        } else if (r.obdWindowRemain > 0) {
+            r.obdWindowRemain -= static_cast<int>(nFrames);
+            if (r.obdWindowRemain <= 0) {
+                r.obdWindowRemain = 0;
+                r.obdOnsetActive  = false;  // window expired — give up
+            }
+        }
+        if (r.obdOnsetActive && !gated && r.provNote.load(std::memory_order_relaxed) == -1) {
+            int op = r.obd.process(in, static_cast<int>(nFrames),
+                                   static_cast<float>(m->sampleRate));
+            // Feed OBP output into voting buffer; only fire when supermajority reached.
+            const int voted = r.obdVoting.update(
+                (op >= r.cfg.midiLow && op <= r.cfg.midiHigh) ? op : -1);
+            if (voted != -1) {
+                // Suppress if any other range already has a live provisional
+                // that is the fundamental of this note (voted - 12 or - 24).
+                // That means we are detecting a harmonic, not the real pitch.
+                bool isHarmonic = false;
+                for (const auto& other : m->ranges) {
+                    if (other.get() == &r) continue;
+                    const int op = other->provNote.load(std::memory_order_relaxed);
+                    if (op != -1) {
+                        const int diff = voted - op;
+                        if (diff == 12 || diff == 24) { isHarmonic = true; break; }
+                    }
+                }
+                // Arm off regardless; if harmonic, don't fire — just drop this onset.
+                r.obdOnsetActive  = false;
+                r.obdWindowRemain = 0;
+                r.obdVoting.reset();
+                if (!isHarmonic) {
+                    r.provMidiPitch = voted;
+                    r.provNote.store(voted, std::memory_order_release);
+                }
+            }
+        } else if (gated) {
+            r.obd.reset();
+            r.obdVoting.reset();
+            r.obdOnsetActive  = false;
+            r.obdWindowRemain = 0;
+        }
+
         // Dispatch snapshot locklessly: normal path (ringSize/2 fresh audio) or onset path.
         if (!r.snapChan.ready.load(std::memory_order_acquire)
             && r.ringFilled >= rs
@@ -406,7 +586,9 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
             std::memcpy(r.snapChan.data.data(),       r.ring.data() + tail, p1 * sizeof(float));
             if (p1 < rs)
                 std::memcpy(r.snapChan.data.data() + p1, r.ring.data(), (rs - p1) * sizeof(float));
-            r.snapChan.snapshotSize = rs;
+            r.snapChan.snapshotSize       = rs;
+            r.snapChan.provNoteAtDispatch = r.provNote.load(std::memory_order_relaxed);
+            r.snapChan.provOnMs           = r.provOnTimeMs;
             r.snapChan.ready.store(true, std::memory_order_release);
             r.freshSamples = 0;
             sem_post(&r.snapChan.sem);
@@ -552,13 +734,16 @@ int main(int argc, char** argv)
     mon.startTime = std::chrono::steady_clock::now();
     g_mon         = &mon;
 
+    static constexpr float CNN_FRAME_MS = 11.6f;  // 1 CNN output frame ≈ 11.6 ms
+
     for (const auto& rc : rangeCfg.ranges) {
         auto r             = std::make_unique<RangeState>();
         r->cfg             = rc;
         r->ringSize        = windowMsToRingSize(rc.windowMs);
         r->minFreshSamples = std::max(r->ringSize / 2, MIN_FRESH_FLOOR);
         r->ring.assign(RING_MAX, 0.0f);
-        r->bp      = std::make_unique<BasicPitch>();
+        r->bp              = std::make_unique<BasicPitch>();
+        r->obdMinHoldMs    = 5.0 * rc.minNoteLength * CNN_FRAME_MS;
         mon.ranges.push_back(std::move(r));
     }
 
@@ -568,6 +753,13 @@ int main(int argc, char** argv)
 
     mon.sampleRate = jack_get_sample_rate(client);
     std::printf("JACK:       %.0f Hz, buffer %u frames\n", mon.sampleRate, jack_get_buffer_size(client));
+
+    // Configure per-range OBP lowpass: cutoff at 1.5× range max freq, capped below Nyquist.
+    for (auto& rp : mon.ranges) {
+        const float cutoff = std::min(midiToFreq(rp->cfg.midiHigh) * 1.5f,
+                                      static_cast<float>(mon.sampleRate) * 0.45f);
+        rp->obd.setLowpass(cutoff, static_cast<float>(mon.sampleRate));
+    }
 
     mon.inPort  = jack_port_register(client, "audio_in",  JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput,  0);
     mon.outPort = jack_port_register(client, "audio_out", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
