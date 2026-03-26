@@ -57,6 +57,26 @@ void BasicPitchCNN::reset()
     mInputArray.fill(0.0f);
 }
 
+void BasicPitchCNN::saveCircularState(CircularBufferState& s) const
+{
+    s.contours   = mContoursCircularBuffer;
+    s.notes      = mNotesCircularBuffer;
+    s.concat2    = mConcat2CircularBuffer;
+    s.contourIdx = mContourIdx;
+    s.noteIdx    = mNoteIdx;
+    s.concat2Idx = mConcat2Idx;
+}
+
+void BasicPitchCNN::restoreCircularState(const CircularBufferState& s)
+{
+    mContoursCircularBuffer = s.contours;
+    mNotesCircularBuffer    = s.notes;
+    mConcat2CircularBuffer  = s.concat2;
+    mContourIdx = s.contourIdx;
+    mNoteIdx    = s.noteIdx;
+    mConcat2Idx = s.concat2Idx;
+}
+
 int BasicPitchCNN::getNumFramesLookahead()
 {
     return mTotalLookahead;

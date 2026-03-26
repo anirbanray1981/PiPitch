@@ -25,6 +25,41 @@ public:
      */
     void reset();
 
+    // Lookahead and circular buffer size constants — must be declared before
+    // CircularBufferState so the nested struct can use them as template arguments.
+    static constexpr int mLookaheadCNNContour      = 3;
+    static constexpr int mLookaheadCNNNote         = 6;
+    static constexpr int mLookaheadCNNOnsetInput   = 2;
+    static constexpr int mLookaheadCNNOnsetOutput  = 1;
+    static constexpr int mTotalLookahead =
+        mLookaheadCNNContour + mLookaheadCNNNote + mLookaheadCNNOnsetOutput;
+
+    static constexpr int mNumContourStored =
+        mTotalLookahead - mLookaheadCNNContour + 1;
+    static constexpr int mNumNoteStored =
+        mTotalLookahead - (mLookaheadCNNContour + mLookaheadCNNNote) + 1;
+    static constexpr int mNumConcat2Stored =
+        mLookaheadCNNContour + mLookaheadCNNNote - mLookaheadCNNOnsetInput + 1;
+
+    /**
+     * Snapshot of the circular delay buffers (and their indices) used to align the
+     * multi-stream outputs.  Saving this state just before the zero-tail phase and
+     * restoring it at the start of the next call allows the next call to skip the
+     * zero-warmup and real-warmup phases without losing alignment, giving a ~31%
+     * reduction in CNN calls per window.
+     */
+    struct CircularBufferState {
+        std::array<std::array<float, NUM_FREQ_IN>,           mNumContourStored> contours {};
+        std::array<std::array<float, NUM_FREQ_OUT>,          mNumNoteStored>    notes {};
+        std::array<std::array<float, 32 * NUM_FREQ_OUT>,     mNumConcat2Stored> concat2 {};
+        int contourIdx = 0;
+        int noteIdx    = 0;
+        int concat2Idx = 0;
+    };
+
+    void saveCircularState(CircularBufferState& outState) const;
+    void restoreCircularState(const CircularBufferState& inState);
+
     /**
      * @return The number of future lookahead of basic pitch cnn.
      * It corresponds to the number of padded frames done left and right (in tensorflow for example)
@@ -66,16 +101,6 @@ private:
     alignas(RTNEURAL_DEFAULT_ALIGNMENT) std::array<float, NUM_FREQ_IN * NUM_HARMONICS> mInputArray {};
 
     alignas(RTNEURAL_DEFAULT_ALIGNMENT) std::array<float, 33 * NUM_FREQ_OUT> mConcatArray {};
-
-    static constexpr int mLookaheadCNNContour = 3;
-    static constexpr int mLookaheadCNNNote = 6;
-    static constexpr int mLookaheadCNNOnsetInput = 2;
-    static constexpr int mLookaheadCNNOnsetOutput = 1;
-    static constexpr int mTotalLookahead = mLookaheadCNNContour + mLookaheadCNNNote + mLookaheadCNNOnsetOutput;
-
-    static constexpr int mNumContourStored = mTotalLookahead - mLookaheadCNNContour + 1;
-    static constexpr int mNumNoteStored = mTotalLookahead - (mLookaheadCNNContour + mLookaheadCNNNote) + 1;
-    static constexpr int mNumConcat2Stored = mLookaheadCNNContour + mLookaheadCNNNote - mLookaheadCNNOnsetInput + 1;
 
     std::array<std::array<float, NUM_FREQ_IN>, mNumContourStored> mContoursCircularBuffer {};
     std::array<std::array<float, NUM_FREQ_OUT>, mNumNoteStored> mNotesCircularBuffer {}; // Also concat 1

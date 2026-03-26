@@ -398,9 +398,9 @@ int main(int argc, char** argv)
     }
 
     printf("\n  Recommendation for live performance:\n");
-    printf("  * Minimum window = 125 ms (1/16 @ 120 BPM) + CNN lookahead (116 ms)\n");
-    printf("    → 250 ms absolute floor, but use >= 500 ms for reliable note edges.\n");
-    printf("  * 500 ms: best balance of latency and accuracy at 100-120 BPM.\n");
+    printf("  * Stateful inference removes the old ~116 ms hard floor.\n");
+    printf("    Practical minimum: ~35 ms (3 CQT frames); quality improves with window size.\n");
+    printf("  * 120-150 ms: good balance of latency and accuracy for most material.\n");
     printf("  * 1000 ms: safer for slower tempos or complex chords.\n");
     printf("  * No retraining needed — ONNX model and CNN both accept variable length.\n");
 

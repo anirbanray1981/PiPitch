@@ -4,30 +4,24 @@
  * Compiled multiple times with different -march flags by CMake.
  * Loaded by neuralnote_guitar2midi.so (the wrapper) via dlopen().
  *
- * Latency model
- * ─────────────
- * Previous design: accumulate 2 s → transcribe → clear → repeat.
- *   Latency ≈ 2000 ms (fill) + 378 ms (inference) = ~2400 ms.
+ * Threading model
+ * ───────────────
+ * One worker thread per note range.  All inter-thread communication is lockless:
  *
- * This design: ring buffer + background worker thread.
- *   A circular buffer always holds the latest 2 s of 22050-Hz audio.
- *   run() writes new audio into the ring and immediately hands a snapshot
- *   to the worker (non-blocking try_to_lock).  The worker runs inference
- *   continuously; as soon as one inference finishes the next snapshot is
- *   already waiting.
+ *   run() → worker :  SnapshotChannel  (SPSC, atomic ready flag + POSIX semaphore)
+ *   worker → run() :  MidiOutQueue     (SPSC ring buffer, atomic head/tail)
  *
- *   Effective latency ≈ inference_time + one_run()_block
- *                     ≈ 380 ms on Pi 4 (NEON)
- *                     ≈ 200 ms on Pi 5 (dotprod+fp16, estimated)
+ * run() writes into the ring buffer and checks the atomic ready flag.  When
+ * MIN_FRESH_SAMPLES (25 ms) of new audio have arrived and the worker has consumed
+ * the previous snapshot, it copies the ring into the snapshot slot, sets ready,
+ * and posts the semaphore.  The worker sleeps on the semaphore, runs inference,
+ * then pushes MIDI events to its per-range MidiOutQueue.  run() drains all
+ * MidiOutQueues each cycle — no mutex anywhere on the hot path.
  *
- * Note tracking
- * ─────────────
- * Instead of paired note-on/off from a single batch, we maintain
- * `activeSet`: the set of pitches present in the most recent inference.
- * Each inference result is diffed against activeSet:
- *   new pitches  → note-on
- *   gone pitches → note-off
- * This naturally handles the sliding window without duplicate events.
+ * Per-range configuration
+ * ───────────────────────
+ * If neuralnote_ranges.conf exists in the bundle directory each [range] section
+ * defines a separate MIDI range.  Without it, single-range mode uses LV2 ports.
  */
 
 #include <lv2/core/lv2.h>
@@ -42,12 +36,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <semaphore.h>
 #include <set>
 #include <thread>
 #include <vector>
@@ -56,6 +49,7 @@
 #include "BinaryData.h"
 #include "BasicPitch.h"
 #include "BasicPitchConstants.h"
+#include "NoteRangeConfig.h"
 
 #define PLUGIN_URI "https://github.com/DamRsn/NeuralNote/guitar2midi"
 
@@ -68,27 +62,43 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// Ring buffer allocated at maximum window size (2000 ms).
 static constexpr int RING_MAX = static_cast<int>(AUDIO_SAMPLE_RATE * 2.0); // 44100
 
-// Convert window_ms control port value → ring size in 22050-Hz samples.
+// Absolute floor on fresh samples before a normal (non-onset) dispatch (~25 ms).
+// The per-range steady-state threshold is ringSize/2; this floor only applies to
+// very short windows so onset-triggered dispatches aren't immediately re-dispatched.
+static constexpr int MIN_FRESH_FLOOR = static_cast<int>(AUDIO_SAMPLE_RATE * 0.025f);
+
+// Onset detection: force-dispatch when a pick attack is detected.
+// onsetRatio: current block RMS must exceed the smoothed background by this factor.
+// onsetAlpha: background tracker time constant (~1/alpha blocks to settle).
+// onsetBlankMs: suppression window after a trigger to avoid re-firing on the same note.
+static constexpr float ONSET_RATIO    = 3.0f;
+static constexpr float ONSET_ALPHA    = 0.05f;
+static constexpr float ONSET_BLANK_MS = 50.0f;
+
+// MIDI output queue capacity per range (events between run() calls; 64 is ample).
+static constexpr int MIDI_QUEUE_CAP = 64;
+
 static inline int windowMsToRingSize(float ms)
 {
-    const float clamped = std::clamp(ms, 50.0f, 2000.0f);
+    const float clamped = std::clamp(ms, 35.0f, 2000.0f);
     return std::min(static_cast<int>(clamped / 1000.0f * AUDIO_SAMPLE_RATE), RING_MAX);
 }
 
 // ── Port indices ──────────────────────────────────────────────────────────────
 
 enum PortIndex {
-    PORT_AUDIO_IN  = 0,
-    PORT_MIDI_OUT  = 1,
-    PORT_THRESHOLD = 2,
-    PORT_MODE      = 3,
-    PORT_AUDIO_OUT = 4,
-    PORT_GATE      = 5,
-    PORT_MIN_DUR   = 6,
-    PORT_AMP_FLOOR = 7,
+    PORT_AUDIO_IN         = 0,
+    PORT_MIDI_OUT         = 1,
+    PORT_THRESHOLD        = 2,
+    PORT_MODE             = 3,
+    PORT_AUDIO_OUT        = 4,
+    PORT_GATE             = 5,
+    PORT_MIN_DUR          = 6,
+    PORT_AMP_FLOOR        = 7,
+    PORT_FRAME_THRESHOLD  = 8,
+    PORT_MIN_NOTE_LENGTH  = 9,
 };
 
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
@@ -110,144 +120,235 @@ static void mapURIs(LV2_URID_Map* map, URIs* uris)
 
 struct PendingNote { bool noteOn; uint8_t pitch; uint8_t velocity; };
 
+// ── Lockless SPSC snapshot channel (run() → worker) ──────────────────────────
+//
+// Ordering contract:
+//   Producer: write data/snapshotSize → ready.store(true, release) → sem_post
+//   Consumer: sem_wait → ready.load(acquire) → read data/snapshotSize → ready.store(false, release)
+//
+// The release/acquire on `ready` provides the happens-before edge; sem_post/wait
+// additionally ensures the worker sleeps when idle.
+
+struct SnapshotChannel {
+    std::vector<float> data;              // RING_MAX capacity
+    int                snapshotSize    = 0;
+    std::atomic<bool>  ready{false};   // producer sets; worker clears
+    std::atomic<bool>  quit{false};
+    sem_t              sem;
+
+    SnapshotChannel()  { data.resize(RING_MAX); sem_init(&sem, 0, 0); }
+    ~SnapshotChannel() { sem_destroy(&sem); }
+    SnapshotChannel(const SnapshotChannel&)          = delete;
+    SnapshotChannel& operator=(const SnapshotChannel&) = delete;
+    SnapshotChannel(SnapshotChannel&&)               = delete;
+    SnapshotChannel& operator=(SnapshotChannel&&)    = delete;
+};
+
+// ── Lockless SPSC MIDI output queue (worker → run()) ─────────────────────────
+//
+// Standard single-producer / single-consumer ring buffer.
+// Producer: worker thread.  Consumer: run().
+
+struct MidiOutQueue {
+    PendingNote      buf[MIDI_QUEUE_CAP];
+    std::atomic<int> head{0};   // run() advances
+    std::atomic<int> tail{0};   // worker advances
+
+    // Called from worker thread only.
+    void push(PendingNote n) {
+        const int t    = tail.load(std::memory_order_relaxed);
+        const int next = (t + 1) % MIDI_QUEUE_CAP;
+        if (next == head.load(std::memory_order_acquire)) return; // drop if full
+        buf[t] = n;
+        tail.store(next, std::memory_order_release);
+    }
+
+    // Called from run() only.
+    bool pop(PendingNote& out) {
+        const int h = head.load(std::memory_order_relaxed);
+        if (h == tail.load(std::memory_order_acquire)) return false;
+        out = buf[h];
+        head.store((h + 1) % MIDI_QUEUE_CAP, std::memory_order_release);
+        return true;
+    }
+};
+
+// Forward declaration
+struct NeuralNotePlugin;
+
+// ── Per-range runtime state ───────────────────────────────────────────────────
+
+struct PerRangeState {
+    NoteRange cfg;
+
+    std::unique_ptr<BasicPitch> basicPitch;
+
+    // Ring buffer (22050-Hz resampled audio)
+    std::vector<float> ringBuf;
+    int ringHead         = 0;
+    int ringFilled       = 0;
+    int freshSamples     = 0;
+    int ringSize         = 0;
+    int minFreshSamples  = 0;  // = max(ringSize/2, MIN_FRESH_FLOOR); set at init/resize
+
+    // Lockless inter-thread channels
+    SnapshotChannel snapChan;   // run() → worker
+    MidiOutQueue    midiOut;    // worker → run()
+
+    // Note tracking (worker thread only — no synchronisation needed)
+    std::set<uint8_t>      activeSet;
+    std::map<uint8_t, int> noteHold;
+
+    // Per-range worker thread
+    std::thread workerThread;
+
+    // Single-range mode: run() writes these; worker reads them.
+    // Ordering guaranteed by the semaphore post/wait on snapChan.
+    std::atomic<float> onsetSensitivity{0.6f};
+    std::atomic<float> frameThresholdVal{0.5f};
+    std::atomic<float> minNoteFramesVal{6.0f};
+    std::atomic<bool>  paramsChanged{false};
+
+    // Non-copyable / non-moveable (owns SnapshotChannel which owns sem_t)
+    PerRangeState()                              = default;
+    PerRangeState(const PerRangeState&)          = delete;
+    PerRangeState& operator=(const PerRangeState&) = delete;
+    PerRangeState(PerRangeState&&)               = delete;
+    PerRangeState& operator=(PerRangeState&&)    = delete;
+};
+
 // ── Plugin instance ───────────────────────────────────────────────────────────
 
 struct NeuralNotePlugin {
-    // LV2 infrastructure
     LV2_URID_Map*   map;
     LV2_Log_Logger  logger;
     LV2_Atom_Forge  forge;
     URIs            uris;
 
-    // Ports
     const float*       audioIn;
     float*             audioOut;
     LV2_Atom_Sequence* midiOut;
     const float*       threshold;
-    const float*       windowMs;  // inference window 50–2000 ms (default 300)
-    const float*       gate;      // noise gate floor (linear RMS, default 0.003 ≈ -50 dBFS)
-    const float*       minDur;    // minimum note duration in ms (default 100)
-    const float*       ampFloor;  // minimum note amplitude 0.0-1.0 (default 0.65)
+    const float*       windowMs;
+    const float*       gate;
+    const float*       minDur;
+    const float*       ampFloor;
+    const float*       frameThresholdPort;
+    const float*       minNoteLengthPort;
 
-    // Inference engine — only accessed by the worker thread after init
-    std::unique_ptr<BasicPitch> basicPitch;
     double sampleRate;
 
-    // Parameters: written by run(), read by worker (atomic for safety)
-    std::atomic<float> noteSensitivity{0.5f};
-    std::atomic<float> splitSensitivity{0.5f};
-    std::atomic<float> minNoteLengthMs{100.0f};
     std::atomic<float> ampFloorVal{0.65f};
 
-    // Last-seen parameter values — used by run() to detect changes
-    float lastThreshold{0.5f};
-    float lastMinDur{100.0f};
+    // Change-detection (run() only — single-threaded)
+    float lastThreshold{0.6f};
+    float lastFrameThreshold{0.5f};
+    float lastMinDur{30.0f};
+    float lastMinNoteFrames{6.0f};
     float lastAmpFloor{0.65f};
 
-    // ── Ring buffer (22050-Hz resampled audio, circular) ──────────────────
-    // Allocated at RING_MAX (2000 ms); ringSize tracks the active window.
-    // ringHead: next write slot (= oldest sample when ring is full).
-    // ringFilled: valid samples, capped at ringSize.
-    float ringBuf[RING_MAX];
-    int   ringSize   = static_cast<int>(AUDIO_SAMPLE_RATE * 0.3); // default 300 ms
-    int   ringHead   = 0;
-    int   ringFilled = 0;
-    int   freshSamples = 0; // resampled samples written since last snapshot was queued
+    std::vector<std::unique_ptr<PerRangeState>> ranges;
+    bool singleRangeMode = true;
 
-    // ── Background inference worker ────────────────────────────────────────
-    std::thread             workerThread;
-    std::mutex              workerMutex;
-    std::condition_variable workerCv;
-    bool                    workerHasWork    = false;
-    bool                    workerQuit       = false;
-    std::atomic<bool>       workerParamsChanged{false}; // re-eval current audio with new params
-    std::vector<float>      workerSnapshot; // ring linearised for the worker
-
-    // ── Pending MIDI (worker → run()) ─────────────────────────────────────
-    // Protected by midiMutex.  Worker appends; run() drains each cycle.
-    std::mutex               midiMutex;
-    std::vector<PendingNote> pendingMidi;
-    std::set<uint8_t>        activeSet; // pitches currently note-on'd
+    // Onset detector state (run() thread only — no synchronisation needed)
+    float onsetSmoothedRms = 0.001f;
+    int   onsetBlankRemain = 0;      // raw input samples remaining in blank period
 };
 
-// ── Worker thread ─────────────────────────────────────────────────────────────
+// ── Worker thread (one per range) ─────────────────────────────────────────────
 
-// Helper: build note set from inference results and diff against activeSet.
-static void applyInferenceResult(NeuralNotePlugin* self)
+static void applyRangeDiff(PerRangeState& r, float ampFloor)
 {
-    const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
     std::set<uint8_t>          newSet;
     std::map<uint8_t, uint8_t> velMap;
-    for (const auto& ev : self->basicPitch->getNoteEvents()) {
+
+    for (const auto& ev : r.basicPitch->getNoteEvents()) {
         if (static_cast<float>(ev.amplitude) < ampFloor) continue;
-        const auto p = static_cast<uint8_t>(std::clamp(ev.pitch, 0, 127));
-        const auto v = static_cast<uint8_t>(
+        const int p = static_cast<int>(ev.pitch);
+        if (p < r.cfg.midiLow || p > r.cfg.midiHigh) continue;
+        const auto pitch = static_cast<uint8_t>(std::clamp(p, 0, 127));
+        const auto vel   = static_cast<uint8_t>(
             std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127));
-        newSet.insert(p);
-        auto it = velMap.find(p);
-        if (it == velMap.end() || v > it->second)
-            velMap[p] = v;
+        newSet.insert(pitch);
+        auto it = velMap.find(pitch);
+        if (it == velMap.end() || vel > it->second) velMap[pitch] = vel;
     }
-    std::lock_guard<std::mutex> lk(self->midiMutex);
-    for (auto p : newSet)
-        if (!self->activeSet.count(p))
-            self->pendingMidi.push_back({true, p, velMap[p]});
-    for (auto p : self->activeSet)
-        if (!newSet.count(p))
-            self->pendingMidi.push_back({false, p, 0});
-    self->activeSet = std::move(newSet);
+
+    for (auto p : newSet) {
+        r.noteHold.erase(p);
+        if (!r.activeSet.count(p)) {
+            r.midiOut.push({true, p, velMap[p]});
+            r.activeSet.insert(p);
+        }
+    }
+
+    for (auto it = r.noteHold.begin(); it != r.noteHold.end(); ) {
+        if (--(it->second) <= 0) {
+            r.midiOut.push({false, it->first, 0});
+            r.activeSet.erase(it->first);
+            it = r.noteHold.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::vector<uint8_t> immediateOff;
+    for (auto p : r.activeSet) {
+        if (newSet.count(p) || r.noteHold.count(p)) continue;
+        if (r.cfg.holdCycles > 0) {
+            r.noteHold[p] = r.cfg.holdCycles;
+        } else {
+            r.midiOut.push({false, p, 0});
+            immediateOff.push_back(p);
+        }
+    }
+    for (auto p : immediateOff) r.activeSet.erase(p);
 }
 
-static void runWorker(NeuralNotePlugin* self)
+static void runWorkerForRange(NeuralNotePlugin* self, PerRangeState* r)
 {
-    bool hasPriorResult = false; // true once transcribeToMIDI has run at least once
+    bool hasPriorResult = false;
 
     while (true) {
-        std::vector<float> snap;
-        bool hasNewSnap     = false;
-        bool paramsChanged  = false;
+        sem_wait(&r->snapChan.sem);
 
-        {
-            std::unique_lock<std::mutex> lk(self->workerMutex);
-            self->workerCv.wait(lk, [self]{
-                return self->workerHasWork
-                    || self->workerQuit
-                    || self->workerParamsChanged.load(std::memory_order_relaxed);
-            });
-            if (self->workerQuit) break;
-            if (self->workerHasWork) {
-                snap = std::move(self->workerSnapshot);
-                self->workerHasWork = false;
-                hasNewSnap = true;
-            }
-            paramsChanged = self->workerParamsChanged.exchange(false, std::memory_order_relaxed);
-        }
+        if (r->snapChan.quit.load(std::memory_order_acquire)) break;
 
-        // Always apply latest parameters before any inference or re-evaluation
-        self->basicPitch->setParameters(
-            self->noteSensitivity.load(std::memory_order_relaxed),
-            self->splitSensitivity.load(std::memory_order_relaxed),
-            self->minNoteLengthMs.load(std::memory_order_relaxed));
+        const float ampFloor     = self->ampFloorVal.load(std::memory_order_relaxed);
+        const bool  hasSnap      = r->snapChan.ready.load(std::memory_order_acquire);
+        const bool  paramsChgd   = r->paramsChanged.exchange(false, std::memory_order_acq_rel);
 
-        if (hasNewSnap) {
-            // Full inference on new audio window (~380 ms on Pi 4)
-            self->basicPitch->transcribeToMIDI(snap.data(), static_cast<int>(snap.size()));
-            hasPriorResult = true;
-        } else if (paramsChanged && hasPriorResult) {
-            // Re-evaluate stored posteriorgrams with new params — fast, no CNN re-run
-            self->basicPitch->updateMIDI();
+        // Apply latest parameters
+        if (self->singleRangeMode) {
+            const float ft       = r->frameThresholdVal.load(std::memory_order_relaxed);
+            const float os       = r->onsetSensitivity.load(std::memory_order_relaxed);
+            const float frames   = r->minNoteFramesVal.load(std::memory_order_relaxed);
+            const float minDurMs = frames * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
+            r->basicPitch->setParameters(1.0f - ft, os, minDurMs);
         } else {
-            continue;
+            const float minDurMs = r->cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
+            r->basicPitch->setParameters(1.0f - r->cfg.frameThreshold,
+                                          r->cfg.threshold, minDurMs);
         }
 
-        applyInferenceResult(self);
+        if (hasSnap) {
+            r->basicPitch->transcribeToMIDI(r->snapChan.data.data(),
+                                             r->snapChan.snapshotSize);
+            // Release the slot so run() can write the next snapshot
+            r->snapChan.ready.store(false, std::memory_order_release);
+            hasPriorResult = true;
+            applyRangeDiff(*r, ampFloor);
+        } else if (paramsChgd && hasPriorResult && self->singleRangeMode) {
+            r->basicPitch->updateMIDI();   // fast re-evaluation, no CNN
+            applyRangeDiff(*r, ampFloor);
+        }
     }
 
-    // Shutdown: release every active note
-    std::lock_guard<std::mutex> lk(self->midiMutex);
-    for (auto p : self->activeSet)
-        self->pendingMidi.push_back({false, p, 0});
-    self->activeSet.clear();
+    // Shutdown: push note-offs for all active notes
+    for (auto p : r->activeSet)
+        r->midiOut.push({false, p, 0});
+    r->activeSet.clear();
+    r->noteHold.clear();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -261,32 +362,32 @@ static void writeMidi(LV2_Atom_Forge* forge, uint32_t frames,
     lv2_atom_forge_write(forge, msg, 3);
 }
 
-// Resample one host audio block to 22050 Hz and push into the ring buffer.
-static void pushToRing(NeuralNotePlugin* self, const float* in, int inLen)
+static void pushToRing(PerRangeState& r, double sampleRate,
+                        const float* in, int inLen)
 {
-    const int rs = self->ringSize;
-    if (self->sampleRate == 22050.0) {
+    const int rs = r.ringSize;
+    if (sampleRate == 22050.0) {
         for (int i = 0; i < inLen; ++i) {
-            self->ringBuf[self->ringHead] = in[i];
-            self->ringHead = (self->ringHead + 1) % rs;
-            if (self->ringFilled < rs) ++self->ringFilled;
+            r.ringBuf[r.ringHead] = in[i];
+            r.ringHead = (r.ringHead + 1) % rs;
+            if (r.ringFilled < rs) ++r.ringFilled;
         }
-        self->freshSamples += inLen;
+        r.freshSamples += inLen;
         return;
     }
-    const double ratio  = 22050.0 / self->sampleRate;
+    const double ratio  = 22050.0 / sampleRate;
     const int    outLen = static_cast<int>(inLen * ratio);
     for (int i = 0; i < outLen; ++i) {
         const double srcPos = i / ratio;
         const int    s0     = static_cast<int>(srcPos);
         const double frac   = srcPos - s0;
         const int    s1     = std::min(s0 + 1, inLen - 1);
-        self->ringBuf[self->ringHead] =
+        r.ringBuf[r.ringHead] =
             static_cast<float>((1.0 - frac) * in[s0] + frac * in[s1]);
-        self->ringHead = (self->ringHead + 1) % rs;
-        if (self->ringFilled < rs) ++self->ringFilled;
+        r.ringHead = (r.ringHead + 1) % rs;
+        if (r.ringFilled < rs) ++r.ringFilled;
     }
-    self->freshSamples += outLen;
+    r.freshSamples += outLen;
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -319,18 +420,49 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         return nullptr;
     }
 
-    self->basicPitch = std::make_unique<BasicPitch>();
-    self->basicPitch->setParameters(0.5f, 0.5f, 100.0f);
-    self->ringSize = windowMsToRingSize(300.0f); // default 300 ms window
+    std::string cfgPath = std::string(bundlePath);
+    if (!cfgPath.empty() && cfgPath.back() != '/') cfgPath += '/';
+    cfgPath += "neuralnote_ranges.conf";
+    RangeConfig rangeCfg = loadRangeConfig(cfgPath);
 
-    memset(self->ringBuf, 0, sizeof(self->ringBuf));
+    auto makeRange = [&](const NoteRange& cfg) {
+        auto r             = std::make_unique<PerRangeState>();
+        r->cfg             = cfg;
+        r->ringSize        = windowMsToRingSize(cfg.windowMs);
+        r->minFreshSamples = std::max(r->ringSize / 2, MIN_FRESH_FLOOR);
+        r->ringBuf.assign(RING_MAX, 0.0f);
+        r->basicPitch = std::make_unique<BasicPitch>();
+        const float minDurMs = cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
+        r->basicPitch->setParameters(1.0f - cfg.frameThreshold, cfg.threshold, minDurMs);
+        return r;
+    };
 
-    // Start background inference worker
-    self->workerThread = std::thread(runWorker, self);
+    if (!rangeCfg.ranges.empty()) {
+        self->singleRangeMode = false;
+        for (const auto& rc : rangeCfg.ranges)
+            self->ranges.push_back(makeRange(rc));
+        self->ampFloorVal.store(rangeCfg.ampFloor, std::memory_order_relaxed);
+        lv2_log_note(&self->logger, "NeuralNote: loaded %zu ranges from %s\n",
+                     self->ranges.size(), cfgPath.c_str());
+    } else {
+        self->singleRangeMode = true;
+        NoteRange def;
+        def.midiLow = 0; def.midiHigh = 127; def.name = "default";
+        def.windowMs = 150.0f; def.threshold = 0.6f; def.frameThreshold = 0.5f;
+        def.minNoteLength = 6; def.holdCycles = 2;
+        auto r = makeRange(def);
+        r->onsetSensitivity.store(0.6f, std::memory_order_relaxed);
+        r->frameThresholdVal.store(0.5f, std::memory_order_relaxed);
+        r->minNoteFramesVal.store(6.0f, std::memory_order_relaxed);
+        self->ranges.push_back(std::move(r));
+    }
+
+    for (auto& rp : self->ranges)
+        rp->workerThread = std::thread(runWorkerForRange, self, rp.get());
 
     lv2_log_note(&self->logger,
                  "NeuralNote Guitar2MIDI: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
-                 "]  [mode: Fast/Medium/Slow via port 3]\n", rate);
+                 "]  [ranges: %zu, lockless workers]\n", rate, self->ranges.size());
     return static_cast<LV2_Handle>(self);
 }
 
@@ -338,32 +470,35 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
 {
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
     switch (static_cast<PortIndex>(port)) {
-        case PORT_AUDIO_IN:  self->audioIn   = static_cast<const float*>(data);       break;
-        case PORT_AUDIO_OUT: self->audioOut  = static_cast<float*>(data);             break;
-        case PORT_MIDI_OUT:  self->midiOut   = static_cast<LV2_Atom_Sequence*>(data); break;
-        case PORT_THRESHOLD: self->threshold = static_cast<const float*>(data);       break;
-        case PORT_MODE:      self->windowMs  = static_cast<const float*>(data);       break;
-        case PORT_GATE:      self->gate      = static_cast<const float*>(data);       break;
-        case PORT_MIN_DUR:   self->minDur    = static_cast<const float*>(data);       break;
-        case PORT_AMP_FLOOR: self->ampFloor  = static_cast<const float*>(data);       break;
+        case PORT_AUDIO_IN:        self->audioIn            = static_cast<const float*>(data);       break;
+        case PORT_AUDIO_OUT:       self->audioOut           = static_cast<float*>(data);             break;
+        case PORT_MIDI_OUT:        self->midiOut            = static_cast<LV2_Atom_Sequence*>(data); break;
+        case PORT_THRESHOLD:       self->threshold          = static_cast<const float*>(data);       break;
+        case PORT_MODE:            self->windowMs           = static_cast<const float*>(data);       break;
+        case PORT_GATE:            self->gate               = static_cast<const float*>(data);       break;
+        case PORT_MIN_DUR:         self->minDur             = static_cast<const float*>(data);       break;
+        case PORT_AMP_FLOOR:       self->ampFloor           = static_cast<const float*>(data);       break;
+        case PORT_FRAME_THRESHOLD: self->frameThresholdPort = static_cast<const float*>(data);       break;
+        case PORT_MIN_NOTE_LENGTH: self->minNoteLengthPort  = static_cast<const float*>(data);       break;
     }
 }
 
 static void activate(LV2_Handle instance)
 {
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
-    // Reset ring buffer (keep current ringSize / mode)
-    self->ringHead   = 0;
-    self->ringFilled = 0;
-    memset(self->ringBuf, 0, sizeof(self->ringBuf));
-    // Reset inference engine
-    self->basicPitch->reset();
-    // Release all held notes
-    {
-        std::lock_guard<std::mutex> lk(self->midiMutex);
-        for (auto p : self->activeSet)
-            self->pendingMidi.push_back({false, p, 0});
-        self->activeSet.clear();
+    for (auto& rp : self->ranges) {
+        rp->ringHead     = 0;
+        rp->ringFilled   = 0;
+        rp->freshSamples = 0;
+        std::fill(rp->ringBuf.begin(), rp->ringBuf.end(), 0.0f);
+        rp->basicPitch->reset();
+        // Send note-offs for any active notes
+        for (auto p : rp->activeSet)
+            rp->midiOut.push({false, p, 0});
+        rp->activeSet.clear();
+        rp->noteHold.clear();
+        // Cancel any pending snapshot
+        rp->snapChan.ready.store(false, std::memory_order_release);
     }
 }
 
@@ -373,106 +508,135 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 {
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
 
-    // Set up Atom output sequence
     lv2_atom_forge_set_buffer(&self->forge,
                                reinterpret_cast<uint8_t*>(self->midiOut),
                                self->midiOut->atom.size);
     LV2_Atom_Forge_Frame seqFrame;
     lv2_atom_forge_sequence_head(&self->forge, &seqFrame, 0);
 
-    // Deliver MIDI events produced by the last completed inference
-    {
-        std::lock_guard<std::mutex> lk(self->midiMutex);
-        for (const auto& pn : self->pendingMidi)
+    // Drain all per-range MIDI output queues — lockless
+    for (auto& rp : self->ranges) {
+        PendingNote pn;
+        while (rp->midiOut.pop(pn))
             writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                       pn.noteOn ? uint8_t(0x90) : uint8_t(0x80),
                       pn.pitch,
                       pn.noteOn ? pn.velocity : uint8_t(0));
-        self->pendingMidi.clear();
     }
 
-    // Update parameters from control ports; notify worker if any changed.
-    bool paramsChanged = false;
-    if (self->threshold) {
-        const float v = *self->threshold;
-        if (v != self->lastThreshold) { self->lastThreshold = v; paramsChanged = true; }
-        self->noteSensitivity.store(v, std::memory_order_relaxed);
-    }
-    if (self->minDur) {
-        const float v = *self->minDur;
-        if (v != self->lastMinDur) { self->lastMinDur = v; paramsChanged = true; }
-        self->minNoteLengthMs.store(v, std::memory_order_relaxed);
-    }
-    if (self->ampFloor) {
-        const float v = *self->ampFloor;
-        if (v != self->lastAmpFloor) { self->lastAmpFloor = v; paramsChanged = true; }
-        self->ampFloorVal.store(v, std::memory_order_relaxed);
-    }
-    if (paramsChanged) {
-        self->workerParamsChanged.store(true, std::memory_order_relaxed);
-        self->workerCv.notify_one();
-    }
+    // Single-range mode: propagate LV2 port changes to worker atomics
+    if (self->singleRangeMode) {
+        PerRangeState& r     = *self->ranges[0];
+        bool           chgd  = false;
 
-    // Handle window size changes — reset ring so new length takes effect immediately.
-    if (self->windowMs) {
-        const int newRingSize = windowMsToRingSize(*self->windowMs);
-        if (newRingSize != self->ringSize) {
-            self->ringSize    = newRingSize;
-            self->ringHead    = 0;
-            self->ringFilled  = 0;
-            self->freshSamples = 0;
-            memset(self->ringBuf, 0, newRingSize * sizeof(float));
-            self->basicPitch->reset();
-            std::lock_guard<std::mutex> lk(self->midiMutex);
-            for (auto p : self->activeSet)
-                self->pendingMidi.push_back({false, p, 0});
-            self->activeSet.clear();
+        if (self->threshold) {
+            const float v = *self->threshold;
+            if (v != self->lastThreshold) { self->lastThreshold = v; chgd = true; }
+            r.onsetSensitivity.store(v, std::memory_order_relaxed);
         }
-    }
+        if (self->frameThresholdPort) {
+            const float v = *self->frameThresholdPort;
+            if (v != self->lastFrameThreshold) { self->lastFrameThreshold = v; chgd = true; }
+            r.frameThresholdVal.store(v, std::memory_order_relaxed);
+        }
+        if (self->minNoteLengthPort) {
+            const float v = *self->minNoteLengthPort;
+            if (v != self->lastMinNoteFrames) { self->lastMinNoteFrames = v; chgd = true; }
+            r.minNoteFramesVal.store(v, std::memory_order_relaxed);
+        }
+        if (self->minDur) {
+            const float v = *self->minDur;
+            if (v != self->lastMinDur) { self->lastMinDur = v; chgd = true; }
+        }
+        if (chgd) {
+            r.paramsChanged.store(true, std::memory_order_release);
+            sem_post(&r.snapChan.sem);
+        }
 
-    // Output silence — audio_out exists only so Zynthian classifies this as
-    // an audio-effect chain entry; no dry signal is passed through.
-    if (self->audioOut)
-        std::memset(self->audioOut, 0, nSamples * sizeof(float));
-
-    // Noise gate: compute block RMS; if below floor push silence so the ring
-    // flushes out old audio and BasicPitch sees a quiet window.
-    {
-        const float gateFloor = (self->gate && *self->gate > 0.0f) ? *self->gate : 0.003f;
-        float sumSq = 0.0f;
-        for (uint32_t i = 0; i < nSamples; ++i)
-            sumSq += self->audioIn[i] * self->audioIn[i];
-        const float rms = std::sqrt(sumSq / static_cast<float>(nSamples));
-        if (rms >= gateFloor) {
-            pushToRing(self, self->audioIn, static_cast<int>(nSamples));
-        } else {
-            // Fill ring slot with zeros (advancing head keeps timing correct)
-            static const float zeros[8192] = {};
-            int remaining = static_cast<int>(nSamples);
-            while (remaining > 0) {
-                const int chunk = std::min(remaining, 8192);
-                pushToRing(self, zeros, chunk);
-                remaining -= chunk;
+        // Window size change: reset ring + cancel pending snapshot
+        if (self->windowMs) {
+            const int newRingSize = windowMsToRingSize(*self->windowMs);
+            if (newRingSize != r.ringSize) {
+                r.snapChan.ready.store(false, std::memory_order_release);
+                r.ringSize         = newRingSize;
+                r.minFreshSamples  = std::max(newRingSize / 2, MIN_FRESH_FLOOR);
+                r.ringHead    = 0;
+                r.ringFilled  = 0;
+                r.freshSamples = 0;
+                std::fill(r.ringBuf.begin(), r.ringBuf.end(), 0.0f);
+                r.basicPitch->reset();
+                // Release note-offs directly into the output queue
+                for (auto p : r.activeSet)
+                    r.midiOut.push({false, p, 0});
+                r.activeSet.clear();
             }
         }
     }
 
-    // Hand the latest ring snapshot to the worker (non-blocking).
-    // Rate-limited: only queue when at least ringSize/2 fresh resampled samples
-    // have arrived since the last snapshot, capping inference at 2× per window
-    // period and keeping the worker thread below ~50% CPU.
-    const int rs = self->ringSize;
-    if (self->ringFilled >= rs && self->freshSamples >= rs / 2) {
-        std::unique_lock<std::mutex> lk(self->workerMutex, std::try_to_lock);
-        if (lk.owns_lock() && !self->workerHasWork && !self->workerQuit) {
-            self->workerSnapshot.resize(rs);
+    // amp_floor global update
+    if (self->ampFloor) {
+        const float v = *self->ampFloor;
+        if (v != self->lastAmpFloor) {
+            self->lastAmpFloor = v;
+            self->ampFloorVal.store(v, std::memory_order_relaxed);
+        }
+    }
+
+    if (self->audioOut)
+        std::memset(self->audioOut, 0, nSamples * sizeof(float));
+
+    // Noise gate + onset detection (share one RMS computation)
+    const float gateFloor = (self->gate && *self->gate > 0.0f) ? *self->gate : 0.003f;
+    float sumSq = 0.0f;
+    for (uint32_t i = 0; i < nSamples; ++i)
+        sumSq += self->audioIn[i] * self->audioIn[i];
+    const float blockRms = std::sqrt(sumSq / static_cast<float>(nSamples));
+    const bool  gated    = (blockRms < gateFloor);
+
+    // Onset: fire a force-dispatch when the block RMS jumps above ONSET_RATIO × background.
+    // A 50 ms blank prevents re-triggering on the same note.
+    bool onsetFired = false;
+    if (self->onsetBlankRemain > 0) {
+        self->onsetBlankRemain -= static_cast<int>(nSamples);
+        if (self->onsetBlankRemain < 0) self->onsetBlankRemain = 0;
+    } else if (!gated && blockRms > self->onsetSmoothedRms * ONSET_RATIO) {
+        onsetFired             = true;
+        self->onsetBlankRemain = static_cast<int>(self->sampleRate * (ONSET_BLANK_MS / 1000.0f));
+        self->onsetSmoothedRms = blockRms; // jump to current level to suppress immediate re-trigger
+    }
+    if (!onsetFired && self->onsetBlankRemain == 0)
+        self->onsetSmoothedRms = self->onsetSmoothedRms * (1.0f - ONSET_ALPHA) + blockRms * ONSET_ALPHA;
+
+    static const float zeros[8192] = {};
+
+    // Push audio into each range's ring; dispatch snapshot when ready — lockless
+    for (auto& rp : self->ranges) {
+        PerRangeState& r = *rp;
+
+        if (!gated) {
+            pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
+        } else {
+            int rem = static_cast<int>(nSamples);
+            while (rem > 0) {
+                const int chunk = std::min(rem, 8192);
+                pushToRing(r, self->sampleRate, zeros, chunk);
+                rem -= chunk;
+            }
+        }
+
+        // Dispatch snapshot if: ring full, slot free, and either enough fresh audio
+        // has arrived (normal path: ringSize/2) or an onset was detected (early path).
+        if (!r.snapChan.ready.load(std::memory_order_acquire)
+            && r.ringFilled >= r.ringSize
+            && (r.freshSamples >= r.minFreshSamples || onsetFired))
+        {
+            const int rs = r.ringSize;
             for (int i = 0; i < rs; ++i)
-                self->workerSnapshot[i] =
-                    self->ringBuf[(self->ringHead + i) % rs];
-            self->workerHasWork = true;
-            self->freshSamples  = 0;
-            lk.unlock();
-            self->workerCv.notify_one();
+                r.snapChan.data[i] = r.ringBuf[(r.ringHead + i) % rs];
+            r.snapChan.snapshotSize = rs;
+            r.snapChan.ready.store(true, std::memory_order_release);
+            r.freshSamples = 0;
+            sem_post(&r.snapChan.sem);
         }
     }
 
@@ -484,13 +648,13 @@ static void deactivate(LV2_Handle /*instance*/) {}
 static void cleanup(LV2_Handle instance)
 {
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
-    {
-        std::lock_guard<std::mutex> lk(self->workerMutex);
-        self->workerQuit = true;
+    for (auto& rp : self->ranges) {
+        rp->snapChan.quit.store(true, std::memory_order_release);
+        sem_post(&rp->snapChan.sem);
     }
-    self->workerCv.notify_one();
-    if (self->workerThread.joinable())
-        self->workerThread.join();
+    for (auto& rp : self->ranges)
+        if (rp->workerThread.joinable())
+            rp->workerThread.join();
     delete self;
 }
 

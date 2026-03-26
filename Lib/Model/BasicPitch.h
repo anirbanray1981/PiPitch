@@ -61,6 +61,11 @@ private:
 
     size_t mNumFrames = 0;
 
+    // Stateful inference: circular buffer state saved before the zero-tail phase
+    // so the next call can skip the warmup phases.
+    bool mHasState = false;
+    BasicPitchCNN::CircularBufferState mSavedState;
+
     Features mFeaturesCalculator;
     BasicPitchCNN mBasicPitchCNN;
     Notes mNotesCreator;

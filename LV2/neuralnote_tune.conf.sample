@@ -1,0 +1,86 @@
+# neuralnote_tune.conf — per-note-range parameter configuration
+#
+# Copy this file to neuralnote_tune.conf in the same directory as the
+# neuralnote_tune binary. Rename or symlink it as neuralnote_ranges.conf
+# inside the LV2 bundle directory to enable per-range behaviour in the plugin.
+#
+# Global settings (apply to all ranges)
+# ──────────────────────────────────────
+# gate_floor: noise gate threshold (linear RMS). Blocks below this are treated
+#             as silence. Set to 0 to disable the gate.
+# amp_floor:  minimum note amplitude reported by BasicPitch (0.0–1.0). Notes
+#             quieter than this are discarded.
+#
+gate_floor = 0.003
+amp_floor  = 0.65
+
+# Note ranges
+# ───────────
+# Each [range] section defines an independent inference context.
+# Fields:
+#   name            — label shown in console output
+#   midi_low        — lowest MIDI note number in this range  (inclusive)
+#   midi_high       — highest MIDI note number in this range (inclusive)
+#   window          — audio capture window in ms (35–2000). Longer windows
+#                     improve accuracy for low notes; shorter windows reduce
+#                     latency for high notes.
+#   threshold       — onset sensitivity (0.05–0.95). Higher = more sensitive,
+#                     more false positives. Lower = fewer notes detected.
+#   frame_threshold — per-frame confidence threshold (0.05–0.95). Lower values
+#                     extend sustain; higher values tighten note boundaries.
+#   min_note_length — minimum note length in CNN frames (1 frame ≈ 11.6 ms).
+#                     Shorter notes than this are filtered out.
+#   hold_cycles     — number of inference cycles to suppress a note-OFF after a
+#                     note disappears. Each cycle ≈ window/2 ms. Use 2–4 for
+#                     legato bass lines; 0 for fast melodic lines.
+#
+# Ranges should be non-overlapping. Notes outside all ranges are discarded.
+# ──────────────────────────────────────────────────────────────────────────
+
+# ── Low strings: E2–B2 (standard guitar: open E2, A2, D3 area) ──────────────
+# Long window for better sub-bass detection. High hold to prevent legato chatter.
+[range]
+name            = E2-B2
+midi_low        = 40
+midi_high       = 47
+window          = 150
+threshold       = 0.6
+frame_threshold = 0.5
+min_note_length = 6
+hold_cycles     = 4
+
+# ── Mid-low strings: C3–B3 ───────────────────────────────────────────────────
+# Moderate window. Some hold for legato.
+[range]
+name            = C3-B3
+midi_low        = 48
+midi_high       = 59
+window          = 100
+threshold       = 0.6
+frame_threshold = 0.5
+min_note_length = 4
+hold_cycles     = 2
+
+# ── Mid strings: C4–B4 (middle octave) ───────────────────────────────────────
+# Shorter window for faster response. Minimal hold.
+[range]
+name            = C4-B4
+midi_low        = 60
+midi_high       = 71
+window          = 80
+threshold       = 0.6
+frame_threshold = 0.5
+min_note_length = 3
+hold_cycles     = 1
+
+# ── High strings: C5 and above ───────────────────────────────────────────────
+# Shortest window for lowest latency. No hold — notes are short and distinct.
+[range]
+name            = C5+
+midi_low        = 72
+midi_high       = 127
+window          = 60
+threshold       = 0.6
+frame_threshold = 0.5
+min_note_length = 2
+hold_cycles     = 0
