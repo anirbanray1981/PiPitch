@@ -265,6 +265,25 @@ static void runWorker(Monitor* m)
             uint64_t newBits = 0;
             int8_t   newVel[NOTE_COUNT] = {};
             buildNNBits(r, m->ampFloor, newBits, newVel);
+
+            // Cancel grace: first CNN cycle after a new provisional fires often
+            // contains mostly the previous note's audio.  Suppress that cancel so
+            // the next cycle (with a full window of the new note) decides instead.
+            if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
+                r.provLastSeenByCNN = provForDiff;
+                r.provCancelGrace   = 1;
+            }
+            if (provForDiff != -1 && r.provCancelGrace > 0) {
+                const int bit = provForDiff - NOTE_BASE;
+                if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
+                    --r.provCancelGrace;
+                    newBits    |= (1ULL << bit);  // suppress cancel; note already playing
+                    newVel[bit] = 64;             // velocity unused (no new note-ON fired)
+                } else {
+                    r.provCancelGrace = 0;  // CNN confirmed naturally
+                }
+            }
+
             applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff, mono);
 
             // Mono cross-range: new note-ON(s) in this range → kill all other ranges

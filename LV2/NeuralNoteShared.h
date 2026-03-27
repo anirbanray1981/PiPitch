@@ -171,6 +171,11 @@ struct RangeStateBase {
     int                 obdPendingNote     = -1;   // OBP voted but MPM not ready; retry next callback
     int                 obdPendingRemain   = 0;    // sample countdown; clears pending when ≤ 0
 
+    // Worker-only: first CNN cycle after a new provisional fires may contain mostly
+    // the previous note's audio.  One grace cycle suppresses a premature cancel.
+    int                 provLastSeenByCNN  = -1;   // last provisional note the worker processed
+    int                 provCancelGrace    = 0;    // cancel-suppression cycles remaining
+
 #ifdef NEURALNOTE_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
 #endif
