@@ -1,53 +1,41 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
-
-// ── Platform-optimized 64-bit popcount ───────────────────────────────────────
-#if defined(__aarch64__)
-#  include <arm_neon.h>
-static inline int obp_popcount64(uint64_t x) noexcept {
-    const uint8x8_t bytes = vcnt_u8(vcreate_u8(x));
-    return static_cast<int>(vaddv_u8(bytes));
-}
-#elif defined(__GNUC__) || defined(__clang__)
-static inline int obp_popcount64(uint64_t x) noexcept {
-    return __builtin_popcountll(x);
-}
-#else
-static inline int obp_popcount64(uint64_t x) noexcept {
-    x -= (x >> 1) & UINT64_C(0x5555555555555555);
-    x  = (x & UINT64_C(0x3333333333333333)) + ((x >> 2) & UINT64_C(0x3333333333333333));
-    x  = (x + (x >> 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
-    return static_cast<int>((x * UINT64_C(0x0101010101010101)) >> 56);
-}
-#endif
 
 // ── OBP voting buffer ─────────────────────────────────────────────────────────
 // Tracks one candidate note over a sliding window of OBP detections.
 // A note is elected when it wins a supermajority of the last WINDOW cycles.
+// Consecutive-run voting buffer.
+//
+// Requires N_CONSEC consecutive OBP callbacks that all agree on the same note
+// before electing it.  Callbacks where OBP returns -1 (not enough zero-crossings
+// accumulated yet) are silently ignored — they neither advance nor reset the run.
+// A callback that returns a *different* note resets the run to 1.
+//
+// This fires faster than a window-majority buffer (especially for high-frequency
+// notes where OBP produces a result every callback) while being equally or more
+// strict: no gaps are tolerated once positive detections begin.
 struct OBPVotingBuffer {
-    static constexpr int      WINDOW = 12;
-    static constexpr float    MAJORITY = 0.70f;
-    static constexpr int      THRESH   = static_cast<int>(WINDOW * MAJORITY + 0.999f); // 9
-    static constexpr uint64_t MASK     = (UINT64_C(1) << WINDOW) - UINT64_C(1);
+    static constexpr int N_CONSEC = 4;  // consecutive agreeing detections required
 
-    int      note = -1;
-    uint64_t bits = 0;
+    int note = -1;
+    int run  = 0;
 
     // Call once per OBP detection cycle. detected == -1 means no pitch found.
-    // Returns the elected note number [0..127] when THRESH votes are set; -1 otherwise.
+    // Returns the elected note number [0..127] after N_CONSEC consecutive matches;
+    // -1 otherwise.
     int update(int detected) noexcept {
-        bits = (bits << 1) & MASK;
-        if (detected >= 0) {
-            if (detected != note) { note = detected; bits = 1; }
-            else                  { bits |= 1; }
+        if (detected < 0) return -1;  // no result yet — preserve current run
+        if (detected == note) {
+            if (++run >= N_CONSEC) return note;
+        } else {
+            note = detected;
+            run  = 1;
         }
-        if (note >= 0 && obp_popcount64(bits) >= THRESH) return note;
         return -1;
     }
 
-    void reset() noexcept { note = -1; bits = 0; }
+    void reset() noexcept { note = -1; run = 0; }
 };
 
 /**
@@ -79,17 +67,20 @@ struct OBPVotingBuffer {
  * No heap allocation.  Safe to call from a real-time audio thread.
  */
 struct OneBitPitchDetector {
-    // Number of consecutive periods to average before reporting.
-    // Kept small (2) since the voting buffer in neuralnote_tune handles stability.
-    static constexpr int   N_AVG      = 2;
+    // One period per reading — the voting buffer (N_CONSEC=4) handles stability.
+    static constexpr int   N_AVG      = 1;
 
     // Minimum valid periods before a pitch is reported (≤ N_AVG).
-    static constexpr int   MIN_VALID  = 2;
+    static constexpr int   MIN_VALID  = 1;
 
-    // Schmitt threshold = HYST_RATIO × block RMS.
-    // Higher values tolerate stronger harmonics at the cost of needing a
-    // slightly louder signal.  0.5 works well for typical guitar levels.
-    static constexpr float HYST_RATIO = 0.5f;
+    // Schmitt threshold = HYST_RATIO × post-filter amplitude EMA.
+    // Near zero (low ratio) all harmonics are in phase with the fundamental,
+    // so the crossing time is unbiased by harmonic content → accurate period.
+    // Near peak (high ratio) the 2nd harmonic shifts the crossing earlier,
+    // causing the apparent period to be ~6-12 samples shorter → measured note
+    // comes out 1-2 semitones sharp (e.g. B4/A#4 when A4 is played).
+    // 0.25 balances accuracy vs. susceptibility to residual post-filter noise.
+    static constexpr float HYST_RATIO = 0.25f;
 
     // ── 4th-order Butterworth lowpass: two cascaded biquads ───────────────
     // Stage 1 Q = 0.5412, Stage 2 Q = 1.3066 (Butterworth pole pairs).

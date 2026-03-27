@@ -45,12 +45,17 @@
 #include <thread>
 #include <vector>
 
-// BinaryData.h must come before any Lib/Model header
-#include "BinaryData.h"
-#include "BasicPitch.h"
+// McLeod Pitch Method: only on ARMv8.2-A (Pi 5, Cortex-A76).
+// Must be defined before NeuralNoteShared.h so that RangeStateBase and all
+// shared pipeline functions compile in the McLeod call-sites.
+// The neon (Pi 4) build leaves this undefined — no FFTW dependency.
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#  define NEURALNOTE_ENABLE_MPM 1
+#endif
+
 #include "BasicPitchConstants.h"
-#include "NoteRangeConfig.h"
-#include "OneBitPitchDetector.h"
+#include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
+                               // OneBitPitchDetector.h, McLeodPitchDetector.h (if MPM)
 
 #define PLUGIN_URI "https://github.com/DamRsn/NeuralNote/guitar2midi"
 
@@ -61,45 +66,17 @@
 #define NEURALNOTE_STRINGIFY2(x) #x
 #define NEURALNOTE_STRINGIFY(x)  NEURALNOTE_STRINGIFY2(x)
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-static constexpr int RING_MAX = static_cast<int>(AUDIO_SAMPLE_RATE * 2.0); // 44100
-
-// Absolute floor on fresh samples before a normal (non-onset) dispatch (~25 ms).
-// The per-range steady-state threshold is ringSize/2; this floor only applies to
-// very short windows so onset-triggered dispatches aren't immediately re-dispatched.
-static constexpr int MIN_FRESH_FLOOR = static_cast<int>(AUDIO_SAMPLE_RATE * 0.025f);
-
-// Onset detection: force-dispatch when a pick attack is detected.
-// onsetRatio: current block RMS must exceed the smoothed background by this factor.
-// onsetAlpha: background tracker time constant (~1/alpha blocks to settle).
-// onsetBlankMs: suppression window after a trigger to avoid re-firing on the same note.
-static constexpr float ONSET_RATIO    = 3.0f;
-static constexpr float ONSET_ALPHA    = 0.05f;
-static constexpr float ONSET_BLANK_MS = 50.0f;
-
-// MIDI output queue capacity per range (events between run() calls; 64 is ample).
-static constexpr int MIDI_QUEUE_CAP = 64;
-
-static inline int windowMsToRingSize(float ms)
-{
-    const float clamped = std::clamp(ms, 35.0f, 2000.0f);
-    return std::min(static_cast<int>(clamped / 1000.0f * AUDIO_SAMPLE_RATE), RING_MAX);
-}
-
 // ── Port indices ──────────────────────────────────────────────────────────────
 
 enum PortIndex {
-    PORT_AUDIO_IN         = 0,
-    PORT_MIDI_OUT         = 1,
-    PORT_THRESHOLD        = 2,
-    PORT_MODE             = 3,
-    PORT_AUDIO_OUT        = 4,
-    PORT_GATE             = 5,
-    PORT_MIN_DUR          = 6,
-    PORT_AMP_FLOOR        = 7,
-    PORT_FRAME_THRESHOLD  = 8,
-    PORT_MIN_NOTE_LENGTH  = 9,
+    PORT_AUDIO_IN        = 0,
+    PORT_MIDI_OUT        = 1,
+    PORT_AUDIO_OUT       = 2,
+    PORT_THRESHOLD       = 3,
+    PORT_GATE            = 4,
+    PORT_AMP_FLOOR       = 5,
+    PORT_FRAME_THRESHOLD = 6,
+    PORT_MODE            = 7,
 };
 
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
@@ -117,114 +94,13 @@ static void mapURIs(LV2_URID_Map* map, URIs* uris)
     uris->midi_MidiEvent     = map->map(map->handle, LV2_MIDI__MidiEvent);
 }
 
-// ── Pending MIDI event ────────────────────────────────────────────────────────
-
-struct PendingNote { bool noteOn; uint8_t pitch; uint8_t velocity; };
-
-// ── Lockless SPSC snapshot channel (run() → worker) ──────────────────────────
-//
-// Ordering contract:
-//   Producer: write data/snapshotSize → ready.store(true, release) → sem_post
-//   Consumer: sem_wait → ready.load(acquire) → read data/snapshotSize → ready.store(false, release)
-//
-// The release/acquire on `ready` provides the happens-before edge; sem_post/wait
-// additionally ensures the worker sleeps when idle.
-
-struct SnapshotChannel {
-    std::vector<float> data;
-    int                snapshotSize       = 0;
-    int                provNoteAtDispatch = -1;  // set by run() at dispatch; read by worker
-    std::atomic<bool>  ready{false};
-    std::atomic<bool>  quit{false};
-    sem_t              sem;
-
-    SnapshotChannel()  { data.resize(RING_MAX); sem_init(&sem, 0, 0); }
-    ~SnapshotChannel() { sem_destroy(&sem); }
-    SnapshotChannel(const SnapshotChannel&)          = delete;
-    SnapshotChannel& operator=(const SnapshotChannel&) = delete;
-    SnapshotChannel(SnapshotChannel&&)               = delete;
-    SnapshotChannel& operator=(SnapshotChannel&&)    = delete;
-};
-
-// ── Lockless SPSC MIDI output queue (worker → run()) ─────────────────────────
-//
-// Standard single-producer / single-consumer ring buffer.
-// Producer: worker thread.  Consumer: run().
-
-struct MidiOutQueue {
-    PendingNote      buf[MIDI_QUEUE_CAP];
-    std::atomic<int> head{0};   // run() advances
-    std::atomic<int> tail{0};   // worker advances
-
-    // Called from worker thread only.
-    void push(PendingNote n) {
-        const int t    = tail.load(std::memory_order_relaxed);
-        const int next = (t + 1) % MIDI_QUEUE_CAP;
-        if (next == head.load(std::memory_order_acquire)) return; // drop if full
-        buf[t] = n;
-        tail.store(next, std::memory_order_release);
-    }
-
-    // Called from run() only.
-    bool pop(PendingNote& out) {
-        const int h = head.load(std::memory_order_relaxed);
-        if (h == tail.load(std::memory_order_acquire)) return false;
-        out = buf[h];
-        head.store((h + 1) % MIDI_QUEUE_CAP, std::memory_order_release);
-        return true;
-    }
-};
-
 // Forward declaration
 struct NeuralNotePlugin;
 
 // ── Per-range runtime state ───────────────────────────────────────────────────
+// All common fields (including MidiOutQueue midiOut) live in RangeStateBase.
 
-struct PerRangeState {
-    NoteRange cfg;
-
-    std::unique_ptr<BasicPitch> basicPitch;
-
-    // Ring buffer (22050-Hz resampled audio)
-    std::vector<float> ringBuf;
-    int ringHead         = 0;
-    int ringFilled       = 0;
-    int freshSamples     = 0;
-    int ringSize         = 0;
-    int minFreshSamples  = 0;  // = max(ringSize/2, MIN_FRESH_FLOOR); set at init/resize
-
-    // Lockless inter-thread channels
-    SnapshotChannel snapChan;   // run() → worker
-    MidiOutQueue    midiOut;    // worker → run()
-
-    // Note tracking (worker thread only — no synchronisation needed)
-    std::set<uint8_t>      activeSet;
-    std::map<uint8_t, int> noteHold;
-
-    // Two-phase pitch detection: OneBitPitch fires a provisional note-ON
-    // immediately; BasicPitch CNN confirms, corrects, or cancels it.
-    OneBitPitchDetector obd;
-    std::atomic<int>    provNote{-1};  // -1 = none; set by run(), cleared by worker
-    OBPVotingBuffer     obdVoting;
-    bool                obdOnsetActive  = false;
-    int                 obdWindowRemain = 0;
-
-    // Per-range worker thread
-    std::thread workerThread;
-
-    // Single-range mode: run() writes these; worker reads them.
-    // Ordering guaranteed by the semaphore post/wait on snapChan.
-    std::atomic<float> onsetSensitivity{0.6f};
-    std::atomic<float> frameThresholdVal{0.5f};
-    std::atomic<float> minNoteFramesVal{6.0f};
-    std::atomic<bool>  paramsChanged{false};
-
-    // Non-copyable / non-moveable (owns SnapshotChannel which owns sem_t)
-    PerRangeState()                              = default;
-    PerRangeState(const PerRangeState&)          = delete;
-    PerRangeState& operator=(const PerRangeState&) = delete;
-    PerRangeState(PerRangeState&&)               = delete;
-    PerRangeState& operator=(PerRangeState&&)    = delete;
+struct RangeState : RangeStateBase {
 };
 
 // ── Plugin instance ───────────────────────────────────────────────────────────
@@ -238,140 +114,118 @@ struct NeuralNotePlugin {
     const float*       audioIn;
     float*             audioOut;
     LV2_Atom_Sequence* midiOut;
-    const float*       threshold;
-    const float*       windowMs;
+    const float*       thresholdPort;
     const float*       gate;
-    const float*       minDur;
     const float*       ampFloor;
     const float*       frameThresholdPort;
-    const float*       minNoteLengthPort;
+    const float*       modePort;
 
     double sampleRate;
 
+    std::atomic<float> thresholdVal{0.6f};
+    std::atomic<float> frameThresholdVal{0.5f};
     std::atomic<float> ampFloorVal{0.65f};
+    std::atomic<int>   modeVal{0};  // 0 = poly, 1 = mono
 
-    // Change-detection (run() only — single-threaded)
-    float lastThreshold{0.6f};
-    float lastFrameThreshold{0.5f};
-    float lastMinDur{30.0f};
-    float lastMinNoteFrames{6.0f};
-    float lastAmpFloor{0.65f};
 
-    std::vector<std::unique_ptr<PerRangeState>> ranges;
+    std::vector<std::unique_ptr<RangeState>> ranges;
     bool singleRangeMode = true;
 
     // Onset detector state (run() thread only — no synchronisation needed)
     float onsetSmoothedRms = 0.001f;
-    int   onsetBlankRemain = 0;      // raw input samples remaining in blank period
+    int   onsetBlankRemain = 0;
+
+    // Single worker thread shared across all ranges
+    std::thread       workerThread;
+    std::atomic<bool> workerQuit{false};
+    sem_t             workerSem;
 };
 
-// ── Worker thread (one per range) ─────────────────────────────────────────────
+// ── Worker thread ──────────────────────────────────────────────────────────────
 
-static void applyRangeDiff(PerRangeState& r, float ampFloor)
+static void runWorker(NeuralNotePlugin* self)
 {
-    std::set<uint8_t>          newSet;
-    std::map<uint8_t, uint8_t> velMap;
-
-    for (const auto& ev : r.basicPitch->getNoteEvents()) {
-        if (static_cast<float>(ev.amplitude) < ampFloor) continue;
-        const int p = static_cast<int>(ev.pitch);
-        if (p < r.cfg.midiLow || p > r.cfg.midiHigh) continue;
-        const auto pitch = static_cast<uint8_t>(std::clamp(p, 0, 127));
-        const auto vel   = static_cast<uint8_t>(
-            std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127));
-        newSet.insert(pitch);
-        auto it = velMap.find(pitch);
-        if (it == velMap.end() || vel > it->second) velMap[pitch] = vel;
-    }
-
-    for (auto p : newSet) {
-        r.noteHold.erase(p);
-        if (!r.activeSet.count(p)) {
-            r.midiOut.push({true, p, velMap[p]});
-            r.activeSet.insert(p);
-        }
-    }
-
-    for (auto it = r.noteHold.begin(); it != r.noteHold.end(); ) {
-        if (--(it->second) <= 0) {
-            r.midiOut.push({false, it->first, 0});
-            r.activeSet.erase(it->first);
-            it = r.noteHold.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    std::vector<uint8_t> immediateOff;
-    for (auto p : r.activeSet) {
-        if (newSet.count(p) || r.noteHold.count(p)) continue;
-        if (r.cfg.holdCycles > 0) {
-            r.noteHold[p] = r.cfg.holdCycles;
-        } else {
-            r.midiOut.push({false, p, 0});
-            immediateOff.push_back(p);
-        }
-    }
-    for (auto p : immediateOff) r.activeSet.erase(p);
-}
-
-static void runWorkerForRange(NeuralNotePlugin* self, PerRangeState* r)
-{
-    bool hasPriorResult = false;
+    std::array<bool, 8> hasPriorResult = {};
 
     while (true) {
-        sem_wait(&r->snapChan.sem);
+        sem_wait(&self->workerSem);
+        if (self->workerQuit.load(std::memory_order_acquire)) break;
 
-        if (r->snapChan.quit.load(std::memory_order_acquire)) break;
+        const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
+        const bool  mono     = (self->modeVal.load(std::memory_order_relaxed) == 1);
 
-        const float ampFloor     = self->ampFloorVal.load(std::memory_order_relaxed);
-        const bool  hasSnap      = r->snapChan.ready.load(std::memory_order_acquire);
-        const bool  paramsChgd   = r->paramsChanged.exchange(false, std::memory_order_acq_rel);
+        for (int ri = 0; ri < static_cast<int>(self->ranges.size()); ++ri) {
+            RangeState& r = *self->ranges[ri];
+            const bool hasSnap    = r.snapChan.ready.load(std::memory_order_acquire);
 
-        // Apply latest parameters
-        if (self->singleRangeMode) {
-            const float ft       = r->frameThresholdVal.load(std::memory_order_relaxed);
-            const float os       = r->onsetSensitivity.load(std::memory_order_relaxed);
-            const float frames   = r->minNoteFramesVal.load(std::memory_order_relaxed);
-            const float minDurMs = frames * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
-            r->basicPitch->setParameters(1.0f - ft, os, minDurMs);
-        } else {
-            const float minDurMs = r->cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
-            r->basicPitch->setParameters(1.0f - r->cfg.frameThreshold,
-                                          r->cfg.threshold, minDurMs);
-        }
-
-        if (hasSnap) {
-            r->basicPitch->transcribeToMIDI(r->snapChan.data.data(),
-                                             r->snapChan.snapshotSize);
-            // Release the slot so run() can write the next snapshot
-            r->snapChan.ready.store(false, std::memory_order_release);
-            hasPriorResult = true;
-
-            // Two-phase: if a provisional OneBitPitch note was sent, insert it into
-            // activeSet before applyRangeDiff so the CNN result handles it cleanly:
-            //   CNN confirms  → note in both activeSet + newSet → no double note-ON
-            //   CNN corrects  → applyRangeDiff sends note-OFF + correct note-ON
-            //   CNN finds nil → applyRangeDiff sends note-OFF
-            const int prov = r->snapChan.provNoteAtDispatch;
-            if (prov != -1) {
-                r->activeSet.insert(static_cast<uint8_t>(prov));
-                r->snapChan.provNoteAtDispatch = -1;
-                r->provNote.store(-1, std::memory_order_release);
+            {
+                const float os       = self->thresholdVal.load(std::memory_order_relaxed);
+                const float ft       = self->frameThresholdVal.load(std::memory_order_relaxed);
+                const float minDurMs = r.cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
+                r.basicPitch->setParameters(1.0f - ft, os, minDurMs);
             }
 
-            applyRangeDiff(*r, ampFloor);
-        } else if (paramsChgd && hasPriorResult && self->singleRangeMode) {
-            r->basicPitch->updateMIDI();   // fast re-evaluation, no CNN
-            applyRangeDiff(*r, ampFloor);
+            if (hasSnap) {
+                r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
+                                                r.snapChan.snapshotSize);
+                r.snapChan.ready.store(false, std::memory_order_release);
+                hasPriorResult[ri] = true;
+
+                // Two-phase: insert provisional before diff.
+                // Staleness check: if a new provisional has fired since this snapshot
+                // was dispatched, the CNN result doesn't correspond to the current
+                // provisional — don't cancel it.
+                const int prov = r.snapChan.provNoteAtDispatch;
+                r.snapChan.provNoteAtDispatch = -1;
+
+                int provForDiff = -1;
+                if (prov != -1) {
+                    const int currentProv = r.provNote.load(std::memory_order_acquire);
+                    if (currentProv == prov) {
+                        // CNN result matches current provisional — normal two-phase path
+                        r.provNote.store(-1, std::memory_order_release);
+                        if (prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT) {
+                            r.activeNotes |= (1ULL << (prov - NOTE_BASE));
+                            provForDiff = prov;
+                        } else {
+                            r.midiOut.push({false, prov, 0});
+                        }
+                    }
+                    // If stale (currentProv != prov): a new provisional has fired.
+                    // Leave provNote intact; pass provForDiff = -1 to avoid cancelling it.
+                }
+
+                const uint64_t prevActive = r.activeNotes;
+                uint64_t newBits = 0;
+                int8_t   newVel[NOTE_COUNT] = {};
+                buildNNBits(r, ampFloor, newBits, newVel);
+                applyNotesDiff(r, newBits, newVel, provForDiff, mono);
+
+                // Mono cross-range: new note-ON(s) in this range → kill all other ranges
+                if (mono && (r.activeNotes & ~prevActive)) {
+                    for (int oi = 0; oi < static_cast<int>(self->ranges.size()); ++oi) {
+                        if (oi == ri) continue;
+                        RangeState& other = *self->ranges[oi];
+                        for (uint64_t tmp = other.activeNotes; tmp; tmp &= tmp - 1)
+                            other.midiOut.push({false,
+                                NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp)), 0});
+                        other.activeNotes = 0;
+                        other.holdNotes   = 0;
+                        std::memset(other.holdCounts, 0, NOTE_COUNT);
+                        other.monoHeldNote.store(-1, std::memory_order_release);
+                    }
+                }
+            }
         }
     }
 
-    // Shutdown: push note-offs for all active notes
-    for (auto p : r->activeSet)
-        r->midiOut.push({false, p, 0});
-    r->activeSet.clear();
-    r->noteHold.clear();
+    // Shutdown: note-offs for all active notes across all ranges
+    for (auto& rp : self->ranges) {
+        for (uint64_t tmp = rp->activeNotes; tmp; tmp &= tmp - 1)
+            rp->midiOut.push({false, NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp)), 0});
+        rp->activeNotes = 0;
+        rp->holdNotes   = 0;
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -385,13 +239,13 @@ static void writeMidi(LV2_Atom_Forge* forge, uint32_t frames,
     lv2_atom_forge_write(forge, msg, 3);
 }
 
-static void pushToRing(PerRangeState& r, double sampleRate,
+static void pushToRing(RangeState& r, double sampleRate,
                         const float* in, int inLen)
 {
     const int rs = r.ringSize;
     if (sampleRate == 22050.0) {
         for (int i = 0; i < inLen; ++i) {
-            r.ringBuf[r.ringHead] = in[i];
+            r.ring[r.ringHead] = in[i];
             r.ringHead = (r.ringHead + 1) % rs;
             if (r.ringFilled < rs) ++r.ringFilled;
         }
@@ -405,7 +259,7 @@ static void pushToRing(PerRangeState& r, double sampleRate,
         const int    s0     = static_cast<int>(srcPos);
         const double frac   = srcPos - s0;
         const int    s1     = std::min(s0 + 1, inLen - 1);
-        r.ringBuf[r.ringHead] =
+        r.ring[r.ringHead] =
             static_cast<float>((1.0 - frac) * in[s0] + frac * in[s1]);
         r.ringHead = (r.ringHead + 1) % rs;
         if (r.ringFilled < rs) ++r.ringFilled;
@@ -449,43 +303,49 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     RangeConfig rangeCfg = loadRangeConfig(cfgPath);
 
     auto makeRange = [&](const NoteRange& cfg) {
-        auto r             = std::make_unique<PerRangeState>();
+        auto r             = std::make_unique<RangeState>();
         r->cfg             = cfg;
         r->ringSize        = windowMsToRingSize(cfg.windowMs);
         r->minFreshSamples = std::max(r->ringSize / 2, MIN_FRESH_FLOOR);
-        r->ringBuf.assign(RING_MAX, 0.0f);
+        r->ring.assign(RING_MAX, 0.0f);
         r->basicPitch = std::make_unique<BasicPitch>();
         const float minDurMs = cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
-        r->basicPitch->setParameters(1.0f - cfg.frameThreshold, cfg.threshold, minDurMs);
+        r->basicPitch->setParameters(1.0f - self->frameThresholdVal.load(std::memory_order_relaxed),
+                                     self->thresholdVal.load(std::memory_order_relaxed), minDurMs);
+        // Configure per-range OBP lowpass
+        const float sr     = static_cast<float>(rate);
+        const float cutoff = std::min(440.0f * std::pow(2.0f, (cfg.midiHigh - 69) / 12.0f) * 1.5f,
+                                      sr * 0.45f);
+        r->obd.setLowpass(cutoff, sr);
+#ifdef NEURALNOTE_ENABLE_MPM
+        r->mpm.init(sr, cfg.midiLow, cfg.midiHigh);
+#endif
         return r;
     };
 
     if (!rangeCfg.ranges.empty()) {
         self->singleRangeMode = false;
+        // Global params (threshold, frame_threshold, amp_floor, mode) come from
+        // LV2 port defaults (plugin.ttl) — not from the conf file. The host
+        // delivers them via connect_port + run() before any audio is processed.
         for (const auto& rc : rangeCfg.ranges)
             self->ranges.push_back(makeRange(rc));
-        self->ampFloorVal.store(rangeCfg.ampFloor, std::memory_order_relaxed);
         lv2_log_note(&self->logger, "NeuralNote: loaded %zu ranges from %s\n",
                      self->ranges.size(), cfgPath.c_str());
     } else {
         self->singleRangeMode = true;
         NoteRange def;
         def.midiLow = 0; def.midiHigh = 127; def.name = "default";
-        def.windowMs = 150.0f; def.threshold = 0.6f; def.frameThreshold = 0.5f;
-        def.minNoteLength = 6; def.holdCycles = 2;
-        auto r = makeRange(def);
-        r->onsetSensitivity.store(0.6f, std::memory_order_relaxed);
-        r->frameThresholdVal.store(0.5f, std::memory_order_relaxed);
-        r->minNoteFramesVal.store(6.0f, std::memory_order_relaxed);
-        self->ranges.push_back(std::move(r));
+        def.windowMs = 150.0f; def.minNoteLength = 6; def.holdCycles = 2;
+        self->ranges.push_back(makeRange(def));
     }
 
-    for (auto& rp : self->ranges)
-        rp->workerThread = std::thread(runWorkerForRange, self, rp.get());
+    sem_init(&self->workerSem, 0, 0);
+    self->workerThread = std::thread(runWorker, self);
 
     lv2_log_note(&self->logger,
                  "NeuralNote Guitar2MIDI: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
-                 "]  [ranges: %zu, lockless workers]\n", rate, self->ranges.size());
+                 "]  [ranges: %zu, single worker thread]\n", rate, self->ranges.size());
     return static_cast<LV2_Handle>(self);
 }
 
@@ -494,15 +354,13 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
     switch (static_cast<PortIndex>(port)) {
         case PORT_AUDIO_IN:        self->audioIn            = static_cast<const float*>(data);       break;
-        case PORT_AUDIO_OUT:       self->audioOut           = static_cast<float*>(data);             break;
         case PORT_MIDI_OUT:        self->midiOut            = static_cast<LV2_Atom_Sequence*>(data); break;
-        case PORT_THRESHOLD:       self->threshold          = static_cast<const float*>(data);       break;
-        case PORT_MODE:            self->windowMs           = static_cast<const float*>(data);       break;
+        case PORT_AUDIO_OUT:       self->audioOut           = static_cast<float*>(data);             break;
+        case PORT_THRESHOLD:       self->thresholdPort      = static_cast<const float*>(data);       break;
         case PORT_GATE:            self->gate               = static_cast<const float*>(data);       break;
-        case PORT_MIN_DUR:         self->minDur             = static_cast<const float*>(data);       break;
         case PORT_AMP_FLOOR:       self->ampFloor           = static_cast<const float*>(data);       break;
         case PORT_FRAME_THRESHOLD: self->frameThresholdPort = static_cast<const float*>(data);       break;
-        case PORT_MIN_NOTE_LENGTH: self->minNoteLengthPort  = static_cast<const float*>(data);       break;
+        case PORT_MODE:            self->modePort           = static_cast<const float*>(data);       break;
     }
 }
 
@@ -513,19 +371,23 @@ static void activate(LV2_Handle instance)
         rp->ringHead     = 0;
         rp->ringFilled   = 0;
         rp->freshSamples = 0;
-        std::fill(rp->ringBuf.begin(), rp->ringBuf.end(), 0.0f);
+        std::fill(rp->ring.begin(), rp->ring.end(), 0.0f);
         rp->basicPitch->reset();
         rp->obd.reset();
         rp->obdVoting.reset();
-        rp->obdOnsetActive  = false;
-        rp->obdWindowRemain = 0;
+#ifdef NEURALNOTE_ENABLE_MPM
+        rp->mpm.reset();
+#endif
+        rp->obdOnsetActive     = false;
+        rp->obdWindowRemain    = 0;
         rp->provNote.store(-1, std::memory_order_relaxed);
         rp->snapChan.provNoteAtDispatch = -1;
         // Send note-offs for any active notes
-        for (auto p : rp->activeSet)
-            rp->midiOut.push({false, p, 0});
-        rp->activeSet.clear();
-        rp->noteHold.clear();
+        for (uint64_t tmp = rp->activeNotes; tmp; tmp &= tmp - 1)
+            rp->midiOut.push({false, NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp)), 0});
+        rp->activeNotes = 0;
+        rp->holdNotes   = 0;
+        std::memset(rp->holdCounts, 0, NOTE_COUNT);
         // Cancel any pending snapshot
         rp->snapChan.ready.store(false, std::memory_order_release);
     }
@@ -549,67 +411,17 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         while (rp->midiOut.pop(pn))
             writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                       pn.noteOn ? uint8_t(0x90) : uint8_t(0x80),
-                      pn.pitch,
-                      pn.noteOn ? pn.velocity : uint8_t(0));
+                      static_cast<uint8_t>(pn.pitch),
+                      pn.noteOn ? static_cast<uint8_t>(pn.velocity) : uint8_t(0));
     }
 
-    // Single-range mode: propagate LV2 port changes to worker atomics
-    if (self->singleRangeMode) {
-        PerRangeState& r     = *self->ranges[0];
-        bool           chgd  = false;
-
-        if (self->threshold) {
-            const float v = *self->threshold;
-            if (v != self->lastThreshold) { self->lastThreshold = v; chgd = true; }
-            r.onsetSensitivity.store(v, std::memory_order_relaxed);
-        }
-        if (self->frameThresholdPort) {
-            const float v = *self->frameThresholdPort;
-            if (v != self->lastFrameThreshold) { self->lastFrameThreshold = v; chgd = true; }
-            r.frameThresholdVal.store(v, std::memory_order_relaxed);
-        }
-        if (self->minNoteLengthPort) {
-            const float v = *self->minNoteLengthPort;
-            if (v != self->lastMinNoteFrames) { self->lastMinNoteFrames = v; chgd = true; }
-            r.minNoteFramesVal.store(v, std::memory_order_relaxed);
-        }
-        if (self->minDur) {
-            const float v = *self->minDur;
-            if (v != self->lastMinDur) { self->lastMinDur = v; chgd = true; }
-        }
-        if (chgd) {
-            r.paramsChanged.store(true, std::memory_order_release);
-            sem_post(&r.snapChan.sem);
-        }
-
-        // Window size change: reset ring + cancel pending snapshot
-        if (self->windowMs) {
-            const int newRingSize = windowMsToRingSize(*self->windowMs);
-            if (newRingSize != r.ringSize) {
-                r.snapChan.ready.store(false, std::memory_order_release);
-                r.ringSize         = newRingSize;
-                r.minFreshSamples  = std::max(newRingSize / 2, MIN_FRESH_FLOOR);
-                r.ringHead    = 0;
-                r.ringFilled  = 0;
-                r.freshSamples = 0;
-                std::fill(r.ringBuf.begin(), r.ringBuf.end(), 0.0f);
-                r.basicPitch->reset();
-                // Release note-offs directly into the output queue
-                for (auto p : r.activeSet)
-                    r.midiOut.push({false, p, 0});
-                r.activeSet.clear();
-            }
-        }
-    }
-
-    // amp_floor global update
-    if (self->ampFloor) {
-        const float v = *self->ampFloor;
-        if (v != self->lastAmpFloor) {
-            self->lastAmpFloor = v;
-            self->ampFloorVal.store(v, std::memory_order_relaxed);
-        }
-    }
+    // Propagate LV2 port values to worker atomics every callback.
+    // No change-detection: the worker must always see the host's current value,
+    // including values restored from a preset or snapshot before the first run().
+    if (self->thresholdPort)      self->thresholdVal.store(*self->thresholdPort, std::memory_order_relaxed);
+    if (self->frameThresholdPort) self->frameThresholdVal.store(*self->frameThresholdPort, std::memory_order_relaxed);
+    if (self->modePort)           self->modeVal.store(static_cast<int>(*self->modePort + 0.5f), std::memory_order_relaxed);
+    if (self->ampFloor)           self->ampFloorVal.store(*self->ampFloor, std::memory_order_relaxed);
 
     if (self->audioOut)
         std::memset(self->audioOut, 0, nSamples * sizeof(float));
@@ -640,58 +452,92 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
     // Push audio into each range's ring; dispatch snapshot when ready — lockless
     for (auto& rp : self->ranges) {
-        PerRangeState& r = *rp;
+        RangeState& r = *rp;
 
         if (!gated) {
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
-            // Two-phase OneBitPitch: arm on onset, expire after 100 ms.
-            // Voting buffer requires 9/12 consistent readings before firing.
-            if (onsetFired) {
-                r.obdOnsetActive  = true;
-                r.obdWindowRemain = static_cast<int>(self->sampleRate * 0.1f);
-                r.obdVoting.reset();
-                r.obd.reset();
-            } else if (r.obdWindowRemain > 0) {
-                r.obdWindowRemain -= static_cast<int>(nSamples);
-                if (r.obdWindowRemain <= 0) {
-                    r.obdWindowRemain = 0;
-                    r.obdOnsetActive  = false;
-                }
-            }
-            if (r.obdOnsetActive && r.provNote.load(std::memory_order_relaxed) == -1) {
-                const int op = r.obd.process(self->audioIn, static_cast<int>(nSamples),
-                                              static_cast<float>(self->sampleRate));
-                const int voted = r.obdVoting.update(
-                    (op >= r.cfg.midiLow && op <= r.cfg.midiHigh) ? op : -1);
-                if (voted != -1) {
-                    // Suppress if another range already has a provisional that is
-                    // the fundamental of this note (voted - 12 or - 24).
-                    bool isHarmonic = false;
-                    for (const auto& other : self->ranges) {
-                        if (other.get() == &r) continue;
-                        const int op2 = other->provNote.load(std::memory_order_relaxed);
-                        if (op2 != -1) {
-                            const int diff = voted - op2;
-                            if (diff == 12 || diff == 24) { isHarmonic = true; break; }
+            // Two-phase OneBitPitch + MPM: arm on onset, expire after 100 ms.
+            armOrExpireOBP(r, static_cast<float>(self->sampleRate),
+                           static_cast<int>(nSamples), onsetFired);
+
+            // Helper: fire a provisional note — shared by immediate and pending paths.
+            auto fireProv = [&](int note) {
+                if (self->modeVal.load(std::memory_order_relaxed) == 1) {
+                    for (auto& other : self->ranges) {
+                        const int held = other->monoHeldNote.load(std::memory_order_acquire);
+                        if (held != -1 && held != note) {
+                            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                      0x80, static_cast<uint8_t>(held), uint8_t(0));
+                            other->monoHeldNote.store(-1, std::memory_order_release);
                         }
                     }
-                    r.obdOnsetActive  = false;
-                    r.obdWindowRemain = 0;
-                    r.obdVoting.reset();
-                    if (!isHarmonic) {
-                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                  0x90, static_cast<uint8_t>(voted), uint8_t(100));
-                        r.provNote.store(voted, std::memory_order_release);
+                }
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          0x90, static_cast<uint8_t>(note), uint8_t(100));
+                r.provNote.store(note, std::memory_order_release);
+                r.monoHeldNote.store(note, std::memory_order_release);
+            };
+
+#ifdef NEURALNOTE_ENABLE_MPM
+            // Push to MPM while OBP window is active OR while awaiting MPM on a
+            // pending OBP vote — so we can retry analyze() next callback.
+            if (r.obdOnsetActive || r.obdPendingNote != -1)
+                r.mpm.push(self->audioIn, static_cast<int>(nSamples));
+#endif
+
+            if (r.obdOnsetActive) {
+                if (r.provNote.load(std::memory_order_relaxed) == -1) {
+                    const int finalNote = runOBPHPS(r, self->audioIn,
+                                                    static_cast<int>(nSamples),
+                                                    static_cast<float>(self->sampleRate),
+                                                    self->ranges);
+                    if (finalNote != -1) {
+                        bool shouldFire = false;
+#ifdef NEURALNOTE_ENABLE_MPM
+                        const int mpmNote = r.mpm.analyze(
+                            static_cast<float>(self->sampleRate),
+                            r.cfg.midiLow, r.cfg.midiHigh);
+                        if (mpmNote != -1 && mpmNote == finalNote) {
+                            shouldFire = true;
+                        } else if (mpmNote == -1) {
+                            // MPM not ready — save vote and retry next callbacks
+                            r.obdPendingNote   = finalNote;
+                            r.obdPendingRemain = static_cast<int>(self->sampleRate * 0.1f);
+                        }
+                        // mpmNote disagrees: suppressed, no pending
+#else
+                        shouldFire = true;
+#endif
+                        if (shouldFire) fireProv(finalNote);
                     }
                 }
             }
+#ifdef NEURALNOTE_ENABLE_MPM
+            else if (r.obdPendingNote != -1
+                     && r.provNote.load(std::memory_order_relaxed) == -1) {
+                // OBP voted previously but MPM wasn't ready — retry now that more
+                // audio has accumulated.
+                r.obdPendingRemain -= static_cast<int>(nSamples);
+                if (r.obdPendingRemain <= 0) {
+                    r.obdPendingNote = -1;  // timed out — give up
+                } else {
+                    const int mpmNote = r.mpm.analyze(
+                        static_cast<float>(self->sampleRate),
+                        r.cfg.midiLow, r.cfg.midiHigh);
+                    if (mpmNote != -1) {
+                        const int pending = r.obdPendingNote;
+                        r.obdPendingNote = -1;
+                        if (mpmNote == pending) fireProv(pending);
+                        // mpmNote disagrees: suppressed
+                    }
+                    // mpmNote == -1: still not ready, try again next callback
+                }
+            }
+#endif
         } else {
-            // Silence: reset OBP state so stale periods don't persist into next note
-            r.obd.reset();
-            r.obdVoting.reset();
-            r.obdOnsetActive  = false;
-            r.obdWindowRemain = 0;
+            // Silence: clear OBP / MPM state so stale data can't bleed into next note
+            resetOBPOnGate(r);
             int rem = static_cast<int>(nSamples);
             while (rem > 0) {
                 const int chunk = std::min(rem, 8192);
@@ -700,21 +546,20 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             }
         }
 
-        // Dispatch snapshot if: ring full, slot free, and either enough fresh audio
-        // has arrived (normal path: ringSize/2) or an onset was detected (early path).
-        if (!r.snapChan.ready.load(std::memory_order_acquire)
-            && r.ringFilled >= r.ringSize
-            && (r.freshSamples >= r.minFreshSamples || onsetFired))
-        {
-            const int rs = r.ringSize;
-            for (int i = 0; i < rs; ++i)
-                r.snapChan.data[i] = r.ringBuf[(r.ringHead + i) % rs];
-            r.snapChan.snapshotSize       = rs;
-            r.snapChan.provNoteAtDispatch = r.provNote.load(std::memory_order_relaxed);
-            r.snapChan.ready.store(true, std::memory_order_release);
-            r.freshSamples = 0;
-            sem_post(&r.snapChan.sem);
-        }
+        // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
+        dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem);
+    }
+
+    // Second drain: catch any CNN events the worker pushed during this callback.
+    // The first drain (top of run) caught events from before this cycle;
+    // this one reduces CNN note latency by up to one JACK buffer.
+    for (auto& rp : self->ranges) {
+        PendingNote pn;
+        while (rp->midiOut.pop(pn))
+            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                      pn.noteOn ? uint8_t(0x90) : uint8_t(0x80),
+                      static_cast<uint8_t>(pn.pitch),
+                      pn.noteOn ? static_cast<uint8_t>(pn.velocity) : uint8_t(0));
     }
 
     lv2_atom_forge_pop(&self->forge, &seqFrame);
@@ -725,13 +570,11 @@ static void deactivate(LV2_Handle /*instance*/) {}
 static void cleanup(LV2_Handle instance)
 {
     NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
-    for (auto& rp : self->ranges) {
-        rp->snapChan.quit.store(true, std::memory_order_release);
-        sem_post(&rp->snapChan.sem);
-    }
-    for (auto& rp : self->ranges)
-        if (rp->workerThread.joinable())
-            rp->workerThread.join();
+    self->workerQuit.store(true, std::memory_order_release);
+    sem_post(&self->workerSem);
+    if (self->workerThread.joinable())
+        self->workerThread.join();
+    sem_destroy(&self->workerSem);
     delete self;
 }
 

@@ -6,17 +6,18 @@
  * Config file format (INI-style, default path: neuralnote_tune.conf next to binary,
  * or neuralnote_ranges.conf inside the LV2 bundle):
  *
- *   # Global settings
- *   gate_floor  = 0.003
- *   amp_floor   = 0.65
+ *   # Global settings (neuralnote_tune.conf only — not used by the LV2 plugin conf)
+ *   gate_floor      = 0.003
+ *   amp_floor       = 0.65
+ *   threshold       = 0.6
+ *   frame_threshold = 0.5
+ *   mode            = poly    # or mono
  *
  *   [range]
  *   name            = E2-B2
  *   midi_low        = 40
  *   midi_high       = 47
  *   window          = 120
- *   threshold       = 0.6
- *   frame_threshold = 0.5
  *   min_note_length = 6
  *   hold_cycles     = 4
  *
@@ -25,8 +26,6 @@
  *   midi_low        = 48
  *   midi_high       = 59
  *   window          = 80
- *   threshold       = 0.6
- *   frame_threshold = 0.5
  *   min_note_length = 4
  *   hold_cycles     = 2
  *
@@ -38,21 +37,24 @@
 #include <string>
 #include <vector>
 
+enum class PlayMode { POLY, MONO };
+
 struct NoteRange {
-    std::string name          = "default";
-    int   midiLow             = 0;
-    int   midiHigh            = 127;
-    float windowMs            = 150.0f;
-    float threshold           = 0.6f;   // onset sensitivity (0.05-0.95)
-    float frameThreshold      = 0.5f;   // frame confidence (0.05-0.95)
-    int   minNoteLength       = 6;      // frames
-    int   holdCycles          = 2;      // inference cycles to hold OFF for this range
+    std::string name         = "default";
+    int   midiLow            = 0;
+    int   midiHigh           = 127;
+    float windowMs           = 150.0f;
+    int   minNoteLength      = 6;      // CNN frames
+    int   holdCycles         = 2;      // inference cycles to hold OFF for this range
 };
 
 struct RangeConfig {
     std::vector<NoteRange> ranges;
-    float gateFloor = 0.003f;
-    float ampFloor  = 0.65f;
+    float     gateFloor      = 0.003f;
+    float     ampFloor       = 0.65f;
+    float     threshold      = 0.6f;   // onset sensitivity (0.05–0.95)
+    float     frameThreshold = 0.5f;   // frame confidence (0.05–0.95)
+    PlayMode  mode           = PlayMode::POLY;
 };
 
 // Return the first range whose [midiLow, midiHigh] contains pitch, or nullptr.
@@ -99,20 +101,24 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
         std::string val = trim(s.substr(eq + 1).c_str());
         if (val.empty()) continue;
 
-        // gate_floor and amp_floor are always global
-        if (key == "gate_floor") { cfg.gateFloor = std::stof(val); continue; }
-        if (key == "amp_floor")  { cfg.ampFloor  = std::stof(val); continue; }
+        // Global keys — valid anywhere in the file
+        if (key == "gate_floor")      { cfg.gateFloor      = std::stof(val); continue; }
+        if (key == "amp_floor")       { cfg.ampFloor       = std::stof(val); continue; }
+        if (key == "threshold")       { cfg.threshold      = std::stof(val); continue; }
+        if (key == "frame_threshold") { cfg.frameThreshold = std::stof(val); continue; }
+        if (key == "mode") {
+            cfg.mode = (val == "mono") ? PlayMode::MONO : PlayMode::POLY;
+            continue;
+        }
 
         if (!cur) continue; // range-specific keys only valid inside [range]
 
-        if      (key == "name")            cur->name           = val;
-        else if (key == "midi_low")        cur->midiLow        = std::stoi(val);
-        else if (key == "midi_high")       cur->midiHigh       = std::stoi(val);
-        else if (key == "window")          cur->windowMs       = std::stof(val);
-        else if (key == "threshold")       cur->threshold      = std::stof(val);
-        else if (key == "frame_threshold") cur->frameThreshold = std::stof(val);
-        else if (key == "min_note_length") cur->minNoteLength  = std::stoi(val);
-        else if (key == "hold_cycles")     cur->holdCycles     = std::stoi(val);
+        if      (key == "name")            cur->name          = val;
+        else if (key == "midi_low")        cur->midiLow       = std::stoi(val);
+        else if (key == "midi_high")       cur->midiHigh      = std::stoi(val);
+        else if (key == "window")          cur->windowMs      = std::stof(val);
+        else if (key == "min_note_length") cur->minNoteLength = std::stoi(val);
+        else if (key == "hold_cycles")     cur->holdCycles    = std::stoi(val);
     }
 
     std::fclose(f);
