@@ -45,21 +45,17 @@
 #include <thread>
 #include <vector>
 
-// BinaryData.h must come before any Lib/Model header
-#include "BinaryData.h"
-#include "BasicPitch.h"
-#include "BasicPitchConstants.h"
-#include "NoteRangeConfig.h"
-#include "OneBitPitchDetector.h"
-#include "NeuralNoteShared.h"
-
 // McLeod Pitch Method: only on ARMv8.2-A (Pi 5, Cortex-A76).
-// __ARM_FEATURE_DOTPROD is defined when compiling with -march=armv8.2-a+dotprod.
-// The neon (Pi 4) build omits MPM entirely — no FFTW dependency.
+// Must be defined before NeuralNoteShared.h so that RangeStateBase and all
+// shared pipeline functions compile in the McLeod call-sites.
+// The neon (Pi 4) build leaves this undefined — no FFTW dependency.
 #if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
 #  define NEURALNOTE_ENABLE_MPM 1
-#  include "McLeodPitchDetector.h"
 #endif
+
+#include "BasicPitchConstants.h"
+#include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
+                               // OneBitPitchDetector.h, McLeodPitchDetector.h (if MPM)
 
 #define PLUGIN_URI "https://github.com/DamRsn/NeuralNote/guitar2midi"
 
@@ -138,61 +134,17 @@ struct MidiOutQueue {
 struct NeuralNotePlugin;
 
 // ── Per-range runtime state ───────────────────────────────────────────────────
+// All common fields live in RangeStateBase (NeuralNoteShared.h).
 
-struct PerRangeState {
-    NoteRange cfg;
+struct PerRangeState : RangeStateBase {
+    MidiOutQueue midiOut;  // worker → run() (uint8_t pitch/velocity)
 
-    std::unique_ptr<BasicPitch> basicPitch;
-
-    // Ring buffer (22050-Hz resampled audio)
-    std::vector<float> ringBuf;
-    int ringHead         = 0;
-    int ringFilled       = 0;
-    int freshSamples     = 0;
-    int ringSize         = 0;
-    int minFreshSamples  = 0;  // = max(ringSize/2, MIN_FRESH_FLOOR); set at init/resize
-
-    // Lockless inter-thread channels
-    SnapshotChannel snapChan;   // run() → worker
-    MidiOutQueue    midiOut;    // worker → run()
-
-    // Note tracking (worker thread only — no synchronisation needed)
-    // Note state — bus-aligned bitmaps over the guitar range E2–E6 (49 notes)
-    uint64_t activeNotes = 0;
-    uint64_t holdNotes   = 0;
-    alignas(8) int8_t holdCounts[NOTE_COUNT] = {};
-
-    // Two-phase pitch detection: OneBitPitch fires a provisional note-ON
-    // immediately; BasicPitch CNN confirms, corrects, or cancels it.
-    OneBitPitchDetector obd;
-    std::atomic<int>    provNote{-1};  // -1 = none; set by run(), cleared by worker
-    OBPVotingBuffer     obdVoting;
-    std::atomic<int>    obdBlacklistNote{-1};  // note CNN cancelled; suppressed for next onset
-    // Bit-parallel HPS register: accumulates all OBP detections this onset window.
-    // Merged cross-range at voting time to identify the true fundamental.
-    uint64_t            obpHpsBits = 0;
-    bool                obdOnsetActive  = false;
-    int                 obdWindowRemain = 0;
-
-#ifdef NEURALNOTE_ENABLE_MPM
-    // McLeod Pitch Method: runs in parallel with OBP during the onset window.
-    // Provisional fires only if OBP + HPS + MPM all agree on the same note.
-    McLeodPitchDetector mpm;
-#endif
-
-    // Single-range mode: run() writes these; worker reads them.
+    // LV2 single-range mode: run() writes these; worker reads them.
     // Ordering guaranteed by the semaphore post/wait on snapChan.
     std::atomic<float> onsetSensitivity{0.6f};
     std::atomic<float> frameThresholdVal{0.5f};
     std::atomic<float> minNoteFramesVal{6.0f};
     std::atomic<bool>  paramsChanged{false};
-
-    // Non-copyable / non-moveable (owns SnapshotChannel which owns sem_t)
-    PerRangeState()                              = default;
-    PerRangeState(const PerRangeState&)          = delete;
-    PerRangeState& operator=(const PerRangeState&) = delete;
-    PerRangeState(PerRangeState&&)               = delete;
-    PerRangeState& operator=(PerRangeState&&)    = delete;
 };
 
 // ── Plugin instance ───────────────────────────────────────────────────────────
@@ -394,7 +346,7 @@ static void pushToRing(PerRangeState& r, double sampleRate,
     const int rs = r.ringSize;
     if (sampleRate == 22050.0) {
         for (int i = 0; i < inLen; ++i) {
-            r.ringBuf[r.ringHead] = in[i];
+            r.ring[r.ringHead] = in[i];
             r.ringHead = (r.ringHead + 1) % rs;
             if (r.ringFilled < rs) ++r.ringFilled;
         }
@@ -408,7 +360,7 @@ static void pushToRing(PerRangeState& r, double sampleRate,
         const int    s0     = static_cast<int>(srcPos);
         const double frac   = srcPos - s0;
         const int    s1     = std::min(s0 + 1, inLen - 1);
-        r.ringBuf[r.ringHead] =
+        r.ring[r.ringHead] =
             static_cast<float>((1.0 - frac) * in[s0] + frac * in[s1]);
         r.ringHead = (r.ringHead + 1) % rs;
         if (r.ringFilled < rs) ++r.ringFilled;
@@ -456,7 +408,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         r->cfg             = cfg;
         r->ringSize        = windowMsToRingSize(cfg.windowMs);
         r->minFreshSamples = std::max(r->ringSize / 2, MIN_FRESH_FLOOR);
-        r->ringBuf.assign(RING_MAX, 0.0f);
+        r->ring.assign(RING_MAX, 0.0f);
         r->basicPitch = std::make_unique<BasicPitch>();
         const float minDurMs = cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
         r->basicPitch->setParameters(1.0f - cfg.frameThreshold, cfg.threshold, minDurMs);
@@ -524,7 +476,7 @@ static void activate(LV2_Handle instance)
         rp->ringHead     = 0;
         rp->ringFilled   = 0;
         rp->freshSamples = 0;
-        std::fill(rp->ringBuf.begin(), rp->ringBuf.end(), 0.0f);
+        std::fill(rp->ring.begin(), rp->ring.end(), 0.0f);
         rp->basicPitch->reset();
         rp->obd.reset();
         rp->obdVoting.reset();
@@ -607,7 +559,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 r.ringHead    = 0;
                 r.ringFilled  = 0;
                 r.freshSamples = 0;
-                std::fill(r.ringBuf.begin(), r.ringBuf.end(), 0.0f);
+                std::fill(r.ring.begin(), r.ring.end(), 0.0f);
                 r.basicPitch->reset();
                 // Release note-offs directly into the output queue
                 for (uint64_t tmp = r.activeNotes; tmp; tmp &= tmp - 1)
@@ -710,7 +662,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         }
 
         // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
-        dispatchSnapshotIfReady(r, onsetFired, r.ringBuf.data(), 0.0, self->workerSem);
+        dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem);
     }
 
     lv2_atom_forge_pop(&self->forge, &seqFrame);

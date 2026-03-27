@@ -1,25 +1,36 @@
 #pragma once
 /**
- * NeuralNoteShared.h — constants, primitives, and pitch-detection pipeline
- * helpers shared between neuralnote_impl.cpp (LV2 plugin) and
+ * NeuralNoteShared.h — constants, per-range state base, and pitch-detection
+ * pipeline helpers shared between neuralnote_impl.cpp (LV2 plugin) and
  * neuralnote_tune.cpp (JACK tuning tool).
  *
- * Keep this header free of LV2, JACK, and JUCE dependencies.
+ * Keep this header free of LV2 and JACK dependencies.
  *
  * MPM (McLeod Pitch Method) gating
  * ─────────────────────────────────
  * Define NEURALNOTE_ENABLE_MPM before including this header to compile in
- * McLeod calls inside armOrExpireOBP, resetOBPOnGate, and runOBPHPS.
- * neuralnote_impl.cpp defines it only when __ARM_FEATURE_DOTPROD is present
- * (Pi 5 / armv82 build).  neuralnote_tune.cpp always defines it.
+ * McLeod calls inside armOrExpireOBP, resetOBPOnGate, runOBPHPS, and
+ * RangeStateBase.  neuralnote_impl.cpp defines it before its includes when
+ * __ARM_FEATURE_DOTPROD is present (Pi 5 / armv82 build).
+ * neuralnote_tune.cpp always defines it.
  */
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <cstdint>
+#include <memory>
 #include <semaphore.h>
 #include <vector>
+
+// BinaryData.h must precede any Lib/Model header.
+#include "BinaryData.h"
+#include "BasicPitch.h"
+#include "NoteRangeConfig.h"
+#include "OneBitPitchDetector.h"
+#ifdef NEURALNOTE_ENABLE_MPM
+#  include "McLeodPitchDetector.h"
+#endif
 
 // ── Sample rate ───────────────────────────────────────────────────────────────
 // BasicPitch always operates at 22050 Hz; all ring buffers use this rate.
@@ -87,6 +98,77 @@ struct SnapshotChannel {
     SnapshotChannel(SnapshotChannel&&)                 = delete;
     SnapshotChannel& operator=(SnapshotChannel&&)      = delete;
 };
+
+// ── Per-range state base ──────────────────────────────────────────────────────
+//
+// Contains all fields shared between PerRangeState (LV2 plugin) and
+// RangeState (JACK tuning tool).  Each file derives its own struct and adds
+// the file-specific extras (LV2 single-range params / tune hold/logging state)
+// plus a file-specific MidiOutQueue (which uses a different PendingNote type
+// in each target and therefore cannot live here).
+//
+// Field naming convention: use `basicPitch` and `ring` as the canonical names.
+// neuralnote_impl.cpp previously used `basicPitch`/`ringBuf`;
+// neuralnote_tune.cpp previously used `bp`/`ring`.  Both now use the base names.
+
+struct RangeStateBase {
+    NoteRange cfg;
+
+    std::unique_ptr<BasicPitch> basicPitch;  // CNN inference engine
+
+    // Ring buffer: 22050-Hz resampled audio (size RING_MAX, logical size ringSize)
+    std::vector<float> ring;
+    int ringHead        = 0;
+    int ringFilled      = 0;
+    int freshSamples    = 0;
+    int ringSize        = 0;
+    int minFreshSamples = 0;  // = max(ringSize/2, MIN_FRESH_FLOOR)
+
+    SnapshotChannel snapChan;  // audio thread → worker (SPSC, lockless)
+
+    // Note tracking (worker thread only — no synchronisation needed)
+    // Bitmaps over E2 (MIDI 40) … E6 (MIDI 88) — 49 notes in a uint64_t.
+    uint64_t activeNotes = 0;
+    uint64_t holdNotes   = 0;
+    alignas(8) int8_t holdCounts[NOTE_COUNT] = {};
+
+    // Two-phase pitch detection: OBP fires a fast provisional; CNN confirms it.
+    OneBitPitchDetector obd;
+    std::atomic<int>    provNote{-1};           // set by audio thread, cleared by worker
+    OBPVotingBuffer     obdVoting;
+    std::atomic<int>    obdBlacklistNote{-1};   // CNN-cancelled note; suppressed next onset
+    uint64_t            obpHpsBits      = 0;    // HPS accumulator for this onset window
+    bool                obdOnsetActive  = false;
+    int                 obdWindowRemain = 0;
+
+#ifdef NEURALNOTE_ENABLE_MPM
+    McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
+#endif
+
+    // Non-copyable / non-moveable (owns SnapshotChannel which owns sem_t)
+    RangeStateBase()                               = default;
+    RangeStateBase(const RangeStateBase&)          = delete;
+    RangeStateBase& operator=(const RangeStateBase&) = delete;
+    RangeStateBase(RangeStateBase&&)               = delete;
+    RangeStateBase& operator=(RangeStateBase&&)    = delete;
+};
+
+// ── Ring write helper ─────────────────────────────────────────────────────────
+//
+// Append `count` pre-resampled (22050-Hz) samples into the circular ring.
+// Does not perform any sample-rate conversion; caller is responsible for that.
+
+template<typename RangeT>
+static void pushRingSamples(RangeT& r, const float* samples, int count) noexcept
+{
+    const int rs = r.ringSize;
+    for (int i = 0; i < count; ++i) {
+        r.ring[r.ringHead] = samples[i];
+        r.ringHead = (r.ringHead + 1) % rs;
+        if (r.ringFilled < rs) ++r.ringFilled;
+    }
+    r.freshSamples += count;
+}
 
 // ── OBP onset arm / expire ────────────────────────────────────────────────────
 //
@@ -239,16 +321,16 @@ static int runOBPHPS(RangeT& r,
 
 template<typename RangeT>
 static void dispatchSnapshotIfReady(
-    RangeT& r, bool onsetFired,
-    const float* ringData, double provOnMs, sem_t& workerSem)
+    RangeT& r, bool onsetFired, double provOnMs, sem_t& workerSem)
 {
     const int rs = r.ringSize;
     if (r.snapChan.ready.load(std::memory_order_acquire)) return;
     if (r.ringFilled < rs) return;
     if (!onsetFired && r.freshSamples < r.minFreshSamples) return;
 
-    const int tail = r.ringHead;
-    const int p1   = rs - tail;
+    const float* ringData = r.ring.data();
+    const int    tail     = r.ringHead;
+    const int    p1       = rs - tail;
     std::memcpy(r.snapChan.data.data(),       ringData + tail, p1 * sizeof(float));
     if (p1 < rs)
         std::memcpy(r.snapChan.data.data() + p1, ringData,     (rs - p1) * sizeof(float));

@@ -44,17 +44,13 @@
 #include <jack/jack.h>
 
 // MPM is always enabled in neuralnote_tune (Pi 5 target only).
-// This must be defined before NeuralNoteShared.h so that armOrExpireOBP,
-// resetOBPOnGate, and runOBPHPS compile in the McLeod call-sites.
+// Must be defined before NeuralNoteShared.h so that RangeStateBase and all
+// shared pipeline functions compile in the McLeod call-sites.
 #define NEURALNOTE_ENABLE_MPM 1
 
-#include "BinaryData.h"
-#include "BasicPitch.h"
 #include "BasicPitchConstants.h"
-#include "NoteRangeConfig.h"
-#include "OneBitPitchDetector.h"
-#include "McLeodPitchDetector.h"
-#include "NeuralNoteShared.h"
+#include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
+                               // OneBitPitchDetector.h, McLeodPitchDetector.h
 
 // ── tune-only constants ────────────────────────────────────────────────────────
 
@@ -139,60 +135,16 @@ struct MidiOutQueue {
 };
 
 // ── Per-range runtime state ────────────────────────────────────────────────────
+// All common fields live in RangeStateBase (NeuralNoteShared.h).
 
-struct RangeState {
-    NoteRange cfg;
+struct RangeState : RangeStateBase {
+    MidiOutQueue midiOut;  // worker → jackProcess (int pitch, float velocity)
 
-    std::unique_ptr<BasicPitch> bp;
-
-    std::vector<float> ring;
-    int ringHead         = 0;
-    int ringFilled       = 0;
-    int freshSamples     = 0;
-    int ringSize         = 0;
-    int minFreshSamples  = 0;  // = max(ringSize/2, MIN_FRESH_FLOOR)
-
-    SnapshotChannel snapChan;
-    MidiOutQueue    midiOut;
-
-    // Note state — bus-aligned bitmaps over the guitar range E2–E6 (49 notes)
-    uint64_t activeNotes = 0;                    // bit i → MIDI (NOTE_BASE+i) sounding
-    uint64_t holdNotes   = 0;                    // bit i → note in hold countdown
-    alignas(8) int8_t holdCounts[NOTE_COUNT] = {};
-
-    OneBitPitchDetector obd;
-    std::atomic<int>    provNote{-1};   // set by jackProcess, cleared by worker
-    int                 provMidiPitch = -1;  // within-callback: consumed by processSynth
-    double              provOnTimeMs  = 0.0; // set by processSynth, copied to snapChan at dispatch
-    double              obdMinHoldMs  = 0.0; // min ms before CNN may cancel an OBP provisional
-
-    // OBP onset gate and voting buffer
-    bool            obdOnsetActive  = false;
-    int             obdWindowRemain = 0;    // samples remaining in OBP window; expires after 100 ms
-    OBPVotingBuffer obdVoting;
-    std::atomic<int> obdBlacklistNote{-1};  // note CNN cancelled; suppressed for next onset
-
-    // Bit-parallel HPS: accumulates ALL OBP note detections within the current onset
-    // window (not just the consecutive-run winner).  Shared cross-range by ORing all
-    // ranges' registers together at voting time to find the true fundamental.
-    uint64_t obpHpsBits = 0;
-
-    // OBP hold: persistent provisional identity across multiple hold-inference cycles.
-    // provNote is cleared to -1 after the first inference so the worker doesn't re-read
-    // a stale value; pendingProvNote keeps the identity alive until the provisional
-    // actually leaves activeNotes (confirmed, corrected, or cancelled by CNN).
-    int pendingProvNote = -1;
-
-    // McLeod Pitch Method: runs in parallel with OBP during the onset window.
-    // Accumulates native-SR audio; analyze() is called when OBP votes.
-    // Provisional is only fired if OBP + HPS + MPM all agree on the same note.
-    McLeodPitchDetector mpm;
-
-    RangeState()                           = default;
-    RangeState(const RangeState&)          = delete;
-    RangeState& operator=(const RangeState&) = delete;
-    RangeState(RangeState&&)               = delete;
-    RangeState& operator=(RangeState&&)    = delete;
+    // tune-specific fields
+    int    provMidiPitch  = -1;   // set by OBP, consumed by processSynth this callback
+    double provOnTimeMs   = 0.0;  // ms since startTime when provisional fired
+    double obdMinHoldMs   = 0.0;  // minimum ms before CNN may cancel a provisional
+    int    pendingProvNote = -1;  // persists prov identity across OBP hold-inference cycles
 };
 
 // ── Shared state ───────────────────────────────────────────────────────────────
@@ -364,10 +316,10 @@ static void runWorker(Monitor* m)
 
             const float minDurMs = r.cfg.minNoteLength * FFT_HOP
                                    / static_cast<float>(PLUGIN_SR) * 1000.0f;
-            r.bp->setParameters(1.0f - r.cfg.frameThreshold, r.cfg.threshold, minDurMs);
+            r.basicPitch->setParameters(1.0f - r.cfg.frameThreshold, r.cfg.threshold, minDurMs);
 
             const auto t0 = std::chrono::steady_clock::now();
-            r.bp->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
+            r.basicPitch->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
             r.snapChan.ready.store(false, std::memory_order_release);
             const double inferMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -391,7 +343,7 @@ static void runWorker(Monitor* m)
             // Build CNN result as bitmap + velocity array
             uint64_t newBits = 0;
             int8_t   newVel[NOTE_COUNT] = {};
-            for (const auto& ev : r.bp->getNoteEvents()) {
+            for (const auto& ev : r.basicPitch->getNoteEvents()) {
                 if (static_cast<float>(ev.amplitude) < m->ampFloor) continue;
                 const int p = static_cast<int>(ev.pitch);
                 if (p < r.cfg.midiLow || p > r.cfg.midiHigh) continue;
@@ -576,15 +528,9 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     else       resampleLinear(in, static_cast<int>(nFrames), m->sampleRate, resampled);
 
     for (auto& rp : m->ranges) {
-        RangeState& r  = *rp;
-        const int   rs = r.ringSize;
+        RangeState& r = *rp;
 
-        for (float s : resampled) {
-            r.ring[r.ringHead] = s;
-            r.ringHead = (r.ringHead + 1) % rs;
-            if (r.ringFilled < rs) ++r.ringFilled;
-        }
-        r.freshSamples += static_cast<int>(resampled.size());
+        pushRingSamples(r, resampled.data(), static_cast<int>(resampled.size()));
 
         // Two-phase OneBitPitch + MPM: arm on onset, expire after 100 ms.
         armOrExpireOBP(r, static_cast<float>(m->sampleRate),
@@ -631,7 +577,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         }
 
         // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
-        dispatchSnapshotIfReady(r, onsetFired, r.ring.data(), r.provOnTimeMs, m->workerSem);
+        dispatchSnapshotIfReady(r, onsetFired, r.provOnTimeMs, m->workerSem);
     }
 
     processSynth(m, out, static_cast<int>(nFrames));
@@ -782,7 +728,7 @@ int main(int argc, char** argv)
         r->ringSize        = windowMsToRingSize(rc.windowMs);
         r->minFreshSamples = std::max(r->ringSize / 2, MIN_FRESH_FLOOR);
         r->ring.assign(RING_MAX, 0.0f);
-        r->bp              = std::make_unique<BasicPitch>();
+        r->basicPitch              = std::make_unique<BasicPitch>();
         r->obdMinHoldMs    = 2.0 * rc.minNoteLength * CNN_FRAME_MS;
         mon.ranges.push_back(std::move(r));
     }
