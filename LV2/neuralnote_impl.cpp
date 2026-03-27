@@ -662,121 +662,45 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
             // Two-phase OneBitPitch + MPM: arm on onset, expire after 100 ms.
-            if (onsetFired) {
-                r.obdBlacklistNote.store(-1, std::memory_order_relaxed);  // new onset: clear blacklist
-                r.obpHpsBits      = 0;
-                r.obdOnsetActive  = true;
-                r.obdWindowRemain = static_cast<int>(self->sampleRate * 0.1f);
-                r.obdVoting.reset();
-                r.obd.reset();
-#ifdef NEURALNOTE_ENABLE_MPM
-                r.mpm.reset();  // fresh accumulation window for the new onset
-#endif
-            } else if (r.obdWindowRemain > 0) {
-                r.obdWindowRemain -= static_cast<int>(nSamples);
-                if (r.obdWindowRemain <= 0) {
-                    r.obdWindowRemain = 0;
-                    r.obdOnsetActive  = false;
-                }
-            }
+            armOrExpireOBP(r, static_cast<float>(self->sampleRate),
+                           static_cast<int>(nSamples), onsetFired);
 
             if (r.obdOnsetActive) {
 #ifdef NEURALNOTE_ENABLE_MPM
-                // Push all native-SR samples into MPM before OBP sub-block loop
-                // so the full callback is in the buffer when OBP votes below.
+                // Accumulate native-SR samples into MPM before the OBP sub-block loop
+                // so the full callback is buffered when OBP votes below.
                 r.mpm.push(self->audioIn, static_cast<int>(nSamples));
 #endif
-
                 if (r.provNote.load(std::memory_order_relaxed) == -1) {
-                    // Process in small sub-blocks and check the voting buffer after each.
-                    // Fires provisional mid-buffer the moment the threshold is reached.
-                    static constexpr int OBP_CHUNK    = 16;
-                    static constexpr int OBP_NOTE_CAP = 76;  // E5 — reject OBP above this
-                    const float* obpPtr = self->audioIn;
-                    int          obpRem = static_cast<int>(nSamples);
-                    while (r.obdOnsetActive && obpRem > 0) {
-                        const int chunk = std::min(obpRem, OBP_CHUNK);
-                        const int op = r.obd.process(obpPtr, chunk,
-                                                      static_cast<float>(self->sampleRate));
-
-                        // Accumulate all in-bitmap detections for the HPS register.
-                        if (op >= NOTE_BASE && op < NOTE_BASE + NOTE_COUNT)
-                            r.obpHpsBits |= (1ULL << (op - NOTE_BASE));
-
-                        const int voted = r.obdVoting.update(
-                            (op >= r.cfg.midiLow && op <= r.cfg.midiHigh
-                             && op <= OBP_NOTE_CAP) ? op : -1);
-                        if (voted != -1) {
-                            // ── Layer 1: Cross-range harmonic suppression ─────────────
-                            bool isHarmonic = false;
-                            for (const auto& other : self->ranges) {
-                                if (other.get() == &r) continue;
-                                const int op2 = other->provNote.load(std::memory_order_relaxed);
-                                if (op2 != -1) {
-                                    const int diff = voted - op2;
-                                    if (diff == 12 || diff == 24) { isHarmonic = true; break; }
-                                }
-                            }
-
-                            // ── Layer 2: Bit-parallel HPS ────────────────────────────
-                            uint64_t allHps = 0;
-                            for (const auto& other : self->ranges) allHps |= other->obpHpsBits;
-                            const uint64_t hps2    = allHps & (allHps >> 12);
-                            const uint64_t hps3    = hps2   & (allHps >> 19);
-                            const uint64_t hpsBest = hps3 ? hps3 : hps2;
-                            int finalNote = voted;
-                            if (hpsBest) {
-                                const int hpsBit  = __builtin_ctzll(hpsBest);
-                                const int hpsNote = NOTE_BASE + hpsBit;
-                                if (hpsNote >= r.cfg.midiLow && hpsNote <= r.cfg.midiHigh)
-                                    finalNote = hpsNote;    // corrected to lower fundamental
-                                else if (hpsNote < r.cfg.midiLow)
-                                    isHarmonic = true;      // fundamental in lower range → suppress
-                            }
-
-                            r.obdOnsetActive  = false;
-                            r.obdWindowRemain = 0;
-                            r.obdVoting.reset();
-
-                            if (!isHarmonic) {
-                                const int bl = r.obdBlacklistNote.load(std::memory_order_relaxed);
-                                if (finalNote != bl) {
+                    const int finalNote = runOBPHPS(r, self->audioIn,
+                                                    static_cast<int>(nSamples),
+                                                    static_cast<float>(self->sampleRate),
+                                                    self->ranges);
+                    if (finalNote != -1) {
 #ifdef NEURALNOTE_ENABLE_MPM
-                                    // ── Layer 3: MPM consensus check (Pi 5 only) ──────────
-                                    // Provisional fires only if OBP + HPS + MPM all agree.
-                                    const int mpmNote = r.mpm.analyze(
-                                        static_cast<float>(self->sampleRate),
-                                        r.cfg.midiLow, r.cfg.midiHigh);
-                                    if (mpmNote != -1 && mpmNote == finalNote) {
-                                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                                  0x90, static_cast<uint8_t>(finalNote), uint8_t(100));
-                                        r.provNote.store(finalNote, std::memory_order_release);
-                                    }
-                                    // Silent suppression on disagreement
-#else
-                                    // Pi 4: OBP + HPS only — no MPM available
-                                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                              0x90, static_cast<uint8_t>(finalNote), uint8_t(100));
-                                    r.provNote.store(finalNote, std::memory_order_release);
-#endif
-                                }
-                            }
+                        // Layer 3: MPM consensus check (Pi 5 only).
+                        // Provisional fires only if OBP + HPS + MPM all agree.
+                        const int mpmNote = r.mpm.analyze(
+                            static_cast<float>(self->sampleRate),
+                            r.cfg.midiLow, r.cfg.midiHigh);
+                        if (mpmNote != -1 && mpmNote == finalNote) {
+                            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                      0x90, static_cast<uint8_t>(finalNote), uint8_t(100));
+                            r.provNote.store(finalNote, std::memory_order_release);
                         }
-                        obpPtr += chunk;
-                        obpRem -= chunk;
+                        // Silent suppression on disagreement
+#else
+                        // Pi 4: OBP + HPS only — no MPM available
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  0x90, static_cast<uint8_t>(finalNote), uint8_t(100));
+                        r.provNote.store(finalNote, std::memory_order_release);
+#endif
                     }
                 }
             }
         } else {
-            // Silence: reset OBP + MPM state so stale data doesn't persist into next note
-            r.obd.reset();
-            r.obdVoting.reset();
-#ifdef NEURALNOTE_ENABLE_MPM
-            r.mpm.reset();
-#endif
-            r.obpHpsBits      = 0;
-            r.obdOnsetActive  = false;
-            r.obdWindowRemain = 0;
+            // Silence: clear OBP / MPM state so stale data can't bleed into next note
+            resetOBPOnGate(r);
             int rem = static_cast<int>(nSamples);
             while (rem > 0) {
                 const int chunk = std::min(rem, 8192);
@@ -785,21 +709,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             }
         }
 
-        // Dispatch snapshot if: ring full, slot free, and either enough fresh audio
-        // has arrived (normal path: ringSize/2) or an onset was detected (early path).
-        if (!r.snapChan.ready.load(std::memory_order_acquire)
-            && r.ringFilled >= r.ringSize
-            && (r.freshSamples >= r.minFreshSamples || onsetFired))
-        {
-            const int rs = r.ringSize;
-            for (int i = 0; i < rs; ++i)
-                r.snapChan.data[i] = r.ringBuf[(r.ringHead + i) % rs];
-            r.snapChan.snapshotSize       = rs;
-            r.snapChan.provNoteAtDispatch = r.provNote.load(std::memory_order_relaxed);
-            r.snapChan.ready.store(true, std::memory_order_release);
-            r.freshSamples = 0;
-            sem_post(&self->workerSem);
-        }
+        // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
+        dispatchSnapshotIfReady(r, onsetFired, r.ringBuf.data(), 0.0, self->workerSem);
     }
 
     lv2_atom_forge_pop(&self->forge, &seqFrame);
