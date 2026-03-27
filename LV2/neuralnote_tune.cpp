@@ -463,18 +463,17 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         armOrExpireOBP(r, static_cast<float>(m->sampleRate),
                        static_cast<int>(nFrames), onsetFired);
 
-        if (r.obdOnsetActive && !gated) {
-            // Accumulate native-SR samples into MPM before the OBP sub-block loop
-            // so the full callback is buffered when OBP votes below.
+        // Push to MPM while OBP window is active OR while awaiting MPM on a pending vote.
+        if (!gated && (r.obdOnsetActive || r.obdPendingNote != -1))
             r.mpm.push(in, static_cast<int>(nFrames));
 
+        if (r.obdOnsetActive && !gated) {
             if (r.provNote.load(std::memory_order_relaxed) == -1) {
                 const int finalNote = runOBPHPS(r, in,
                                                 static_cast<int>(nFrames),
                                                 static_cast<float>(m->sampleRate),
                                                 m->ranges);
                 if (finalNote == -1 && !r.obdOnsetActive) {
-                    // OBP window just expired without a vote
                     const double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - m->startTime).count();
                     std::printf("[+%.3fs]  --   OBP window expired  no vote  [range %s]\n",
@@ -482,15 +481,17 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                     std::fflush(stdout);
                 }
                 if (finalNote != -1) {
-                    // Layer 3: MPM consensus check — always log outcome.
                     const float  sr      = static_cast<float>(m->sampleRate);
                     const int    mpmNote = r.mpm.analyze(sr, r.cfg.midiLow, r.cfg.midiHigh);
                     const int    mpmFill = r.mpm.circFill;
                     const double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - m->startTime).count();
                     if (mpmNote == -1) {
+                        // MPM not ready — save vote and retry next callbacks
+                        r.obdPendingNote   = finalNote;
+                        r.obdPendingRemain = static_cast<int>(m->sampleRate * 0.1f);
                         std::printf("[+%.3fs]  --   MPM not ready (fill %d/%d)"
-                                    "  OBP→%-4s(%d)  suppressed  [range %s]\n",
+                                    "  OBP→%-4s(%d)  pending  [range %s]\n",
                                     elapsed, mpmFill, McLeodPitchDetector::MPM_BUFSIZE,
                                     midiToName(finalNote).c_str(), finalNote,
                                     r.cfg.name.c_str());
@@ -504,7 +505,6 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
                     } else {
-                        // All three agree — fire provisional
                         std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
                                     "  prov fired  [range %s]\n",
                                     elapsed, mpmFill,
@@ -516,6 +516,48 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                         r.monoHeldNote.store(finalNote, std::memory_order_release);
                     }
                 }
+            }
+        } else if (!gated && r.obdPendingNote != -1
+                   && r.provNote.load(std::memory_order_relaxed) == -1) {
+            // OBP voted previously but MPM wasn't ready — retry now.
+            r.obdPendingRemain -= static_cast<int>(nFrames);
+            if (r.obdPendingRemain <= 0) {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - m->startTime).count();
+                std::printf("[+%.3fs]  --   MPM pending timed out  OBP→%-4s(%d)"
+                            "  [range %s]\n",
+                            elapsed, midiToName(r.obdPendingNote).c_str(),
+                            r.obdPendingNote, r.cfg.name.c_str());
+                std::fflush(stdout);
+                r.obdPendingNote = -1;
+            } else {
+                const float  sr      = static_cast<float>(m->sampleRate);
+                const int    mpmNote = r.mpm.analyze(sr, r.cfg.midiLow, r.cfg.midiHigh);
+                const int    mpmFill = r.mpm.circFill;
+                if (mpmNote != -1) {
+                    const int    pending = r.obdPendingNote;
+                    const double elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - m->startTime).count();
+                    r.obdPendingNote = -1;
+                    if (mpmNote == pending) {
+                        std::printf("[+%.3fs]  --   MPM confirmed pending OBP→%-4s(%d)"
+                                    "  (fill %d)  prov fired  [range %s]\n",
+                                    elapsed, midiToName(pending).c_str(), pending,
+                                    mpmFill, r.cfg.name.c_str());
+                        std::fflush(stdout);
+                        r.provMidiPitch = pending;
+                        r.provNote.store(pending, std::memory_order_release);
+                        r.monoHeldNote.store(pending, std::memory_order_release);
+                    } else {
+                        std::printf("[+%.3fs]  --   MPM suppressed pending OBP→%-4s(%d)"
+                                    "  MPM→%-4s(%d)  (fill %d)  [range %s]\n",
+                                    elapsed, midiToName(pending).c_str(), pending,
+                                    midiToName(mpmNote).c_str(), mpmNote,
+                                    mpmFill, r.cfg.name.c_str());
+                        std::fflush(stdout);
+                    }
+                }
+                // mpmNote == -1: still not ready, try again next callback
             }
         } else if (gated) {
             resetOBPOnGate(r);

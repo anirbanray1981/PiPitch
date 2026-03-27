@@ -461,12 +461,32 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             armOrExpireOBP(r, static_cast<float>(self->sampleRate),
                            static_cast<int>(nSamples), onsetFired);
 
-            if (r.obdOnsetActive) {
+            // Helper: fire a provisional note — shared by immediate and pending paths.
+            auto fireProv = [&](int note) {
+                if (self->modeVal.load(std::memory_order_relaxed) == 1) {
+                    for (auto& other : self->ranges) {
+                        const int held = other->monoHeldNote.load(std::memory_order_acquire);
+                        if (held != -1 && held != note) {
+                            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                      0x80, static_cast<uint8_t>(held), uint8_t(0));
+                            other->monoHeldNote.store(-1, std::memory_order_release);
+                        }
+                    }
+                }
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          0x90, static_cast<uint8_t>(note), uint8_t(100));
+                r.provNote.store(note, std::memory_order_release);
+                r.monoHeldNote.store(note, std::memory_order_release);
+            };
+
 #ifdef NEURALNOTE_ENABLE_MPM
-                // Accumulate native-SR samples into MPM before the OBP sub-block loop
-                // so the full callback is buffered when OBP votes below.
+            // Push to MPM while OBP window is active OR while awaiting MPM on a
+            // pending OBP vote — so we can retry analyze() next callback.
+            if (r.obdOnsetActive || r.obdPendingNote != -1)
                 r.mpm.push(self->audioIn, static_cast<int>(nSamples));
 #endif
+
+            if (r.obdOnsetActive) {
                 if (r.provNote.load(std::memory_order_relaxed) == -1) {
                     const int finalNote = runOBPHPS(r, self->audioIn,
                                                     static_cast<int>(nSamples),
@@ -475,38 +495,46 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                     if (finalNote != -1) {
                         bool shouldFire = false;
 #ifdef NEURALNOTE_ENABLE_MPM
-                        // Layer 3: MPM consensus check (Pi 5 only).
-                        // Provisional fires only if OBP + HPS + MPM all agree.
                         const int mpmNote = r.mpm.analyze(
                             static_cast<float>(self->sampleRate),
                             r.cfg.midiLow, r.cfg.midiHigh);
-                        if (mpmNote != -1 && mpmNote == finalNote)
+                        if (mpmNote != -1 && mpmNote == finalNote) {
                             shouldFire = true;
-                        // Silent suppression on disagreement or not-ready
+                        } else if (mpmNote == -1) {
+                            // MPM not ready — save vote and retry next callbacks
+                            r.obdPendingNote   = finalNote;
+                            r.obdPendingRemain = static_cast<int>(self->sampleRate * 0.1f);
+                        }
+                        // mpmNote disagrees: suppressed, no pending
 #else
-                        // Pi 4: OBP + HPS only — no MPM available
                         shouldFire = true;
 #endif
-                        if (shouldFire) {
-                            // Mono: kill held notes in all ranges before new provisional
-                            if (self->modeVal.load(std::memory_order_relaxed) == 1) {
-                                for (auto& other : self->ranges) {
-                                    const int held = other->monoHeldNote.load(std::memory_order_acquire);
-                                    if (held != -1 && held != finalNote) {
-                                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                                  0x80, static_cast<uint8_t>(held), uint8_t(0));
-                                        other->monoHeldNote.store(-1, std::memory_order_release);
-                                    }
-                                }
-                            }
-                            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                      0x90, static_cast<uint8_t>(finalNote), uint8_t(100));
-                            r.provNote.store(finalNote, std::memory_order_release);
-                            r.monoHeldNote.store(finalNote, std::memory_order_release);
-                        }
+                        if (shouldFire) fireProv(finalNote);
                     }
                 }
             }
+#ifdef NEURALNOTE_ENABLE_MPM
+            else if (r.obdPendingNote != -1
+                     && r.provNote.load(std::memory_order_relaxed) == -1) {
+                // OBP voted previously but MPM wasn't ready — retry now that more
+                // audio has accumulated.
+                r.obdPendingRemain -= static_cast<int>(nSamples);
+                if (r.obdPendingRemain <= 0) {
+                    r.obdPendingNote = -1;  // timed out — give up
+                } else {
+                    const int mpmNote = r.mpm.analyze(
+                        static_cast<float>(self->sampleRate),
+                        r.cfg.midiLow, r.cfg.midiHigh);
+                    if (mpmNote != -1) {
+                        const int pending = r.obdPendingNote;
+                        r.obdPendingNote = -1;
+                        if (mpmNote == pending) fireProv(pending);
+                        // mpmNote disagrees: suppressed
+                    }
+                    // mpmNote == -1: still not ready, try again next callback
+                }
+            }
+#endif
         } else {
             // Silence: clear OBP / MPM state so stale data can't bleed into next note
             resetOBPOnGate(r);

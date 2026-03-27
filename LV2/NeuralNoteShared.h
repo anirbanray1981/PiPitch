@@ -166,6 +166,8 @@ struct RangeStateBase {
     uint64_t            obpHpsBits         = 0;    // HPS accumulator for this onset window
     bool                obdOnsetActive     = false;
     int                 obdWindowRemain    = 0;
+    int                 obdPendingNote     = -1;   // OBP voted but MPM not ready; retry next callback
+    int                 obdPendingRemain   = 0;    // sample countdown; clears pending when ≤ 0
 
 #ifdef NEURALNOTE_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
@@ -210,6 +212,8 @@ static void armOrExpireOBP(RangeT& r, float sampleRate, int nSamples, bool onset
         r.obpHpsBits         = 0;
         r.obdOnsetActive     = true;
         r.obdWindowRemain    = static_cast<int>(sampleRate * 0.1f);  // 100 ms window
+        r.obdPendingNote     = -1;
+        r.obdPendingRemain   = 0;
         r.obdVoting.reset();
         r.obd.reset();
 #ifdef NEURALNOTE_ENABLE_MPM
@@ -240,6 +244,8 @@ static void resetOBPOnGate(RangeT& r) noexcept
     r.obpHpsBits       = 0;
     r.obdOnsetActive   = false;
     r.obdWindowRemain  = 0;
+    r.obdPendingNote   = -1;
+    r.obdPendingRemain = 0;
 }
 
 // ── OBP + HPS voting loop ─────────────────────────────────────────────────────
