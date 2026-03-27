@@ -433,7 +433,6 @@ For all chains to receive NeuralNote MIDI simultaneously:
 | `neuralnote_tune.conf` | Full config for the tuning tool (includes global keys) |
 | `neuralnote-connect.sh` | JACK MIDI fan-out script |
 | `neuralnote-connect.service` | systemd unit for the fan-out script |
-| `LATENCY_OPTIMIZATIONS.md` | Notes on latency reduction strategies |
 
 ---
 
