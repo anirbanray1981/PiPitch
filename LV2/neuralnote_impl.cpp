@@ -77,6 +77,7 @@ enum PortIndex {
     PORT_AMP_FLOOR       = 5,
     PORT_FRAME_THRESHOLD = 6,
     PORT_MODE            = 7,
+    PORT_ONSET_BLANK_MS  = 8,
 };
 
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
@@ -119,13 +120,14 @@ struct NeuralNotePlugin {
     const float*       ampFloor;
     const float*       frameThresholdPort;
     const float*       modePort;
+    const float*       onsetBlankMsPort;
 
     double sampleRate;
 
     std::atomic<float> thresholdVal{0.6f};
     std::atomic<float> frameThresholdVal{0.5f};
     std::atomic<float> ampFloorVal{0.65f};
-    std::atomic<int>   modeVal{0};  // 0 = poly, 1 = mono
+    std::atomic<int>   modeVal{1};  // 0 = poly, 1 = mono  (default: mono)
 
 
     std::vector<std::unique_ptr<RangeState>> ranges;
@@ -361,6 +363,7 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
         case PORT_AMP_FLOOR:       self->ampFloor           = static_cast<const float*>(data);       break;
         case PORT_FRAME_THRESHOLD: self->frameThresholdPort = static_cast<const float*>(data);       break;
         case PORT_MODE:            self->modePort           = static_cast<const float*>(data);       break;
+        case PORT_ONSET_BLANK_MS:  self->onsetBlankMsPort   = static_cast<const float*>(data);       break;
     }
 }
 
@@ -442,7 +445,9 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         if (self->onsetBlankRemain < 0) self->onsetBlankRemain = 0;
     } else if (!gated && blockRms > self->onsetSmoothedRms * ONSET_RATIO) {
         onsetFired             = true;
-        self->onsetBlankRemain = static_cast<int>(self->sampleRate * (ONSET_BLANK_MS / 1000.0f));
+        const float blankMs    = (self->onsetBlankMsPort && *self->onsetBlankMsPort > 0.0f)
+                                     ? *self->onsetBlankMsPort : ONSET_BLANK_MS;
+        self->onsetBlankRemain = static_cast<int>(self->sampleRate * (blankMs / 1000.0f));
         self->onsetSmoothedRms = blockRms; // jump to current level to suppress immediate re-trigger
     }
     if (!onsetFired && self->onsetBlankRemain == 0)

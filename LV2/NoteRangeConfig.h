@@ -56,7 +56,7 @@ struct RangeConfig {
     float     threshold      = 0.6f;   // onset sensitivity (0.05–0.95)
     float     frameThreshold = 0.5f;   // frame confidence (0.05–0.95)
     float     onsetBlankMs   = 25.0f;  // re-trigger suppression window (ms)
-    PlayMode  mode           = PlayMode::POLY;
+    PlayMode  mode           = PlayMode::MONO;
 };
 
 // Return the first range whose [midiLow, midiHigh] contains pitch, or nullptr.
