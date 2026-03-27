@@ -163,6 +163,7 @@ struct RangeStateBase {
     OBPVotingBuffer     obdVoting;
     std::atomic<int>    obdBlacklistNote{-1};   // CNN-cancelled note; suppressed next onset
     std::atomic<int>    monoHeldNote{-1};       // mono mode: current held note (-1 = none)
+    std::atomic<bool>   hasActiveNotes{false};  // worker has active/held notes; suppresses RMS gate
     uint64_t            obpHpsBits         = 0;    // HPS accumulator for this onset window
     bool                obdOnsetActive     = false;
     int                 obdWindowRemain    = 0;
@@ -361,10 +362,13 @@ static void dispatchSnapshotIfReady(
     if (r.ringFilled < rs) return;
     if (!onsetFired && r.freshSamples < r.minFreshSamples) return;
 
-    // RMS gate: skip CNN dispatch if ring energy is negligible.
-    // Catches sympathetic resonance and string buzz that slipped past the
-    // onset detector but carry no real note energy.
-    {
+    // RMS gate: skip CNN dispatch if ring energy is negligible AND the worker
+    // has no active or held notes that still require note-off events.
+    // Catches sympathetic resonance / string buzz that slips past the onset
+    // detector but carries no real note energy.
+    // Bypassed when hasActiveNotes is true so decaying notes always get their
+    // CNN-driven hold countdown and eventual note-off.
+    if (!r.hasActiveNotes.load(std::memory_order_acquire)) {
         const float* rd = r.ring.data();
         float sumSq = 0.0f;
         for (int i = 0; i < rs; ++i) sumSq += rd[i] * rd[i];
@@ -491,4 +495,10 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
         r.monoHeldNote.store(
             r.activeNotes ? (NOTE_BASE + __builtin_ctzll(r.activeNotes)) : -1,
             std::memory_order_release);
+
+    // Let the audio thread know whether there are notes to keep alive.
+    // Used by dispatchSnapshotIfReady to bypass the RMS gate when there are
+    // active or held notes that still need CNN-driven note-offs.
+    r.hasActiveNotes.store(r.activeNotes != 0 || r.holdNotes != 0,
+                           std::memory_order_release);
 }
