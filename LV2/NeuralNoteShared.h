@@ -353,12 +353,23 @@ static int runOBPHPS(RangeT& r,
 
 template<typename RangeT>
 static void dispatchSnapshotIfReady(
-    RangeT& r, bool onsetFired, double provOnMs, sem_t& workerSem)
+    RangeT& r, bool onsetFired, double provOnMs, sem_t& workerSem,
+    float gateFloor = 0.003f)
 {
     const int rs = r.ringSize;
     if (r.snapChan.ready.load(std::memory_order_acquire)) return;
     if (r.ringFilled < rs) return;
     if (!onsetFired && r.freshSamples < r.minFreshSamples) return;
+
+    // RMS gate: skip CNN dispatch if ring energy is negligible.
+    // Catches sympathetic resonance and string buzz that slipped past the
+    // onset detector but carry no real note energy.
+    {
+        const float* rd = r.ring.data();
+        float sumSq = 0.0f;
+        for (int i = 0; i < rs; ++i) sumSq += rd[i] * rd[i];
+        if (sumSq < gateFloor * gateFloor * static_cast<float>(rs)) return;
+    }
 
     const float* ringData = r.ring.data();
     const int    tail     = r.ringHead;

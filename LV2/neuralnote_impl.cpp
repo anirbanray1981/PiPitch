@@ -547,7 +547,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         }
 
         // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
-        dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem);
+        dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem, gateFloor);
     }
 
     // Second drain: catch any CNN events the worker pushed during this callback.

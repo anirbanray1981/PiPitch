@@ -564,7 +564,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         }
 
         // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
-        dispatchSnapshotIfReady(r, onsetFired, r.provOnTimeMs, m->workerSem);
+        dispatchSnapshotIfReady(r, onsetFired, r.provOnTimeMs, m->workerSem, m->gateFloor);
     }
 
     processSynth(m, out, static_cast<int>(nFrames));
