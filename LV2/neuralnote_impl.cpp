@@ -311,11 +311,13 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         r->basicPitch = std::make_unique<BasicPitch>();
         const float minDurMs = cfg.minNoteLength * FFT_HOP / AUDIO_SAMPLE_RATE * 1000.0f;
         r->basicPitch->setParameters(1.0f - cfg.frameThreshold, cfg.threshold, minDurMs);
-        // Configure per-range OBP lowpass
+        // Configure per-range OBP lowpass and minimum-duration gate
         const float sr     = static_cast<float>(rate);
         const float cutoff = std::min(440.0f * std::pow(2.0f, (cfg.midiHigh - 69) / 12.0f) * 1.5f,
                                       sr * 0.45f);
         r->obd.setLowpass(cutoff, sr);
+        r->obdMinDurationSamples = static_cast<int>(
+            cfg.minNoteLength * FFT_HOP / static_cast<float>(AUDIO_SAMPLE_RATE) * rate);
 #ifdef NEURALNOTE_ENABLE_MPM
         r->mpm.init(sr, cfg.midiLow, cfg.midiHigh);
 #endif
@@ -382,8 +384,9 @@ static void activate(LV2_Handle instance)
 #ifdef NEURALNOTE_ENABLE_MPM
         rp->mpm.reset();
 #endif
-        rp->obdOnsetActive  = false;
-        rp->obdWindowRemain = 0;
+        rp->obdOnsetActive     = false;
+        rp->obdWindowRemain    = 0;
+        rp->obdWindowElapsed   = 0;
         rp->provNote.store(-1, std::memory_order_relaxed);
         rp->snapChan.provNoteAtDispatch = -1;
         // Send note-offs for any active notes

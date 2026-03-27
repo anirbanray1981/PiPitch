@@ -113,10 +113,8 @@ struct SynthVoice {
 
 struct RangeState : RangeStateBase {
     // tune-specific fields
-    int    provMidiPitch  = -1;   // set by OBP, consumed by processSynth this callback
-    double provOnTimeMs   = 0.0;  // ms since startTime when provisional fired
-    double obdMinHoldMs   = 0.0;  // minimum ms before CNN may cancel a provisional
-    int    pendingProvNote = -1;  // persists prov identity across OBP hold-inference cycles
+    int    provMidiPitch = -1;   // set by OBP, consumed by processSynth this callback
+    double provOnTimeMs  = 0.0;  // ms since startTime when provisional fired
 };
 
 // ── Shared state ───────────────────────────────────────────────────────────────
@@ -160,33 +158,16 @@ static void onSignal(int) { g_quit.store(true); }
 // ── Worker thread ──────────────────────────────────────────────────────────────
 
 // newBits: bitmap of CNN-detected notes; newVel[i]: velocity (0–127) for bit i.
-// Handles OBP hold (tune-specific) and CNN outcome logging, then delegates the
-// note ON/OFF/hold state machine to the shared applyNotesDiff helper.
+// Logs CNN outcome vs provisional, then delegates the note ON/OFF/hold state
+// machine to the shared applyNotesDiff helper.
 static void applyRangeDiff(Monitor* m, RangeState& r,
                            uint64_t newBits, const int8_t* newVel,
                            double inferMs, int prov)
 {
-    const double elapsed   = std::chrono::duration<double>(
+    const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - m->startTime).count();
-    const double elapsedMs = elapsed * 1000.0;
 
-    // OBP hold: if CNN result is empty and hold hasn't elapsed, keep provisional alive.
-    const bool holdElapsed = (elapsedMs - r.snapChan.provOnMs) >= r.obdMinHoldMs;
-    if (prov != -1 && newBits == 0 && !holdElapsed
-        && prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT) {
-        newBits = 1ULL << (prov - NOTE_BASE);
-        // newVel is a const pointer; use a local override for the held note
-        static thread_local int8_t heldVel[NOTE_COUNT];
-        std::memset(heldVel, 0, NOTE_COUNT);
-        heldVel[prov - NOTE_BASE] = 80;
-        newVel = heldVel;
-        std::printf("[+%.3fs]  --   OBP hold  %-4s (%3d)"
-                    "  [%.0f/%.0f ms  range %s]\n",
-                    elapsed, midiToName(prov).c_str(), prov,
-                    elapsedMs - r.snapChan.provOnMs, r.obdMinHoldMs,
-                    r.cfg.name.c_str());
-        std::fflush(stdout);
-    } else if (prov != -1) {
+    if (prov != -1) {
         // Log CNN outcome vs provisional
         if (bmTest(newBits, prov)) {
             std::printf("[+%.3fs]  --   CNN confirmed OBP %-4s (%3d)"
@@ -255,47 +236,26 @@ static void runWorker(Monitor* m)
 
             // Two-phase: insert provisional into activeNotes before diff.
             // Always clear provNoteAtDispatch/provNote so stale values never repeat.
+            // Two-phase: insert provisional into activeNotes before diff.
+            // Always clear so stale out-of-range values never repeat.
             const int snapProv = r.snapChan.provNoteAtDispatch;
             r.snapChan.provNoteAtDispatch = -1;
             if (snapProv != -1) {
                 r.provNote.store(-1, std::memory_order_release);
                 if (snapProv >= NOTE_BASE && snapProv < NOTE_BASE + NOTE_COUNT) {
                     r.activeNotes |= (1ULL << (snapProv - NOTE_BASE));
-                    r.pendingProvNote = snapProv;  // persist identity across hold inferences
                 } else {
                     // Out-of-bitmap provisional: CNN can never track it, send OFF now.
                     r.midiOut.push({false, snapProv, 0});
-                    r.pendingProvNote = -1;
                 }
             }
+            const int provForDiff = (snapProv >= NOTE_BASE && snapProv < NOTE_BASE + NOTE_COUNT)
+                                    ? snapProv : -1;
 
-            // Build CNN result as bitmap + velocity array
             uint64_t newBits = 0;
             int8_t   newVel[NOTE_COUNT] = {};
-            for (const auto& ev : r.basicPitch->getNoteEvents()) {
-                if (static_cast<float>(ev.amplitude) < m->ampFloor) continue;
-                const int p = static_cast<int>(ev.pitch);
-                if (p < r.cfg.midiLow || p > r.cfg.midiHigh) continue;
-                if (p < NOTE_BASE || p >= NOTE_BASE + NOTE_COUNT) continue;
-                const int bit = p - NOTE_BASE;
-                const int v   = std::clamp(static_cast<int>(ev.amplitude * 127.0), 1, 127);
-                if (!(newBits & (1ULL << bit)) || v > newVel[bit]) {
-                    newBits        |= (1ULL << bit);
-                    newVel[bit]     = static_cast<int8_t>(v);
-                }
-            }
-
-            // Use persistent pendingProvNote so cancelledProv fires correctly even when
-            // the second inference runs after provNote was cleared to -1 (OBP hold path).
-            const int provForDiff = r.pendingProvNote;
+            buildNNBits(r, m->ampFloor, newBits, newVel);
             applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff);
-
-            // Clear pendingProvNote once the provisional has left activeNotes
-            // (confirmed, corrected, or cancelled — i.e. no longer tracked).
-            if (provForDiff != -1
-                && provForDiff >= NOTE_BASE && provForDiff < NOTE_BASE + NOTE_COUNT
-                && !(r.activeNotes & (1ULL << (provForDiff - NOTE_BASE))))
-                r.pendingProvNote = -1;
         }
     }
 
@@ -649,16 +609,13 @@ int main(int argc, char** argv)
     g_mon         = &mon;
     sem_init(&mon.workerSem, 0, 0);
 
-    static constexpr float CNN_FRAME_MS = 11.6f;  // 1 CNN output frame ≈ 11.6 ms
-
     for (const auto& rc : rangeCfg.ranges) {
         auto r             = std::make_unique<RangeState>();
         r->cfg             = rc;
         r->ringSize        = windowMsToRingSize(rc.windowMs);
         r->minFreshSamples = std::max(r->ringSize / 2, MIN_FRESH_FLOOR);
         r->ring.assign(RING_MAX, 0.0f);
-        r->basicPitch              = std::make_unique<BasicPitch>();
-        r->obdMinHoldMs    = 2.0 * rc.minNoteLength * CNN_FRAME_MS;
+        r->basicPitch      = std::make_unique<BasicPitch>();
         mon.ranges.push_back(std::move(r));
     }
 
@@ -669,12 +626,14 @@ int main(int argc, char** argv)
     mon.sampleRate = jack_get_sample_rate(client);
     std::printf("JACK:       %.0f Hz, buffer %u frames\n", mon.sampleRate, jack_get_buffer_size(client));
 
-    // Configure per-range OBP lowpass and MPM (both need the sample rate).
+    // Configure per-range OBP lowpass, MPM, and minimum-duration gate (all need sample rate).
     for (auto& rp : mon.ranges) {
         const float sr     = static_cast<float>(mon.sampleRate);
         const float cutoff = std::min(midiToFreq(rp->cfg.midiHigh) * 1.5f, sr * 0.45f);
         rp->obd.setLowpass(cutoff, sr);
         rp->mpm.init(sr, rp->cfg.midiLow, rp->cfg.midiHigh);
+        rp->obdMinDurationSamples = static_cast<int>(
+            rp->cfg.minNoteLength * FFT_HOP / static_cast<float>(PLUGIN_SR) * mon.sampleRate);
     }
 
     mon.inPort  = jack_port_register(client, "audio_in",  JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput,  0);

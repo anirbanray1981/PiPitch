@@ -162,9 +162,11 @@ struct RangeStateBase {
     std::atomic<int>    provNote{-1};           // set by audio thread, cleared by worker
     OBPVotingBuffer     obdVoting;
     std::atomic<int>    obdBlacklistNote{-1};   // CNN-cancelled note; suppressed next onset
-    uint64_t            obpHpsBits      = 0;    // HPS accumulator for this onset window
-    bool                obdOnsetActive  = false;
-    int                 obdWindowRemain = 0;
+    uint64_t            obpHpsBits         = 0;    // HPS accumulator for this onset window
+    bool                obdOnsetActive     = false;
+    int                 obdWindowRemain    = 0;
+    int                 obdWindowElapsed   = 0;    // native-SR samples elapsed since onset arm
+    int                 obdMinDurationSamples = 0; // OBP cannot fire before this many samples
 
 #ifdef NEURALNOTE_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
@@ -206,16 +208,21 @@ static void armOrExpireOBP(RangeT& r, float sampleRate, int nSamples, bool onset
 {
     if (onsetFired) {
         r.obdBlacklistNote.store(-1, std::memory_order_relaxed);
-        r.obpHpsBits      = 0;
-        r.obdOnsetActive  = true;
-        r.obdWindowRemain = static_cast<int>(sampleRate * 0.1f);
+        r.obpHpsBits         = 0;
+        r.obdOnsetActive     = true;
+        r.obdWindowElapsed   = 0;
+        // Window = minDuration + 50 ms for OBP to vote; at least 100 ms.
+        r.obdWindowRemain    = std::max(static_cast<int>(sampleRate * 0.1f),
+                                        r.obdMinDurationSamples
+                                        + static_cast<int>(sampleRate * 0.05f));
         r.obdVoting.reset();
         r.obd.reset();
 #ifdef NEURALNOTE_ENABLE_MPM
         r.mpm.reset();
 #endif
     } else if (r.obdWindowRemain > 0) {
-        r.obdWindowRemain -= nSamples;
+        r.obdWindowElapsed += nSamples;
+        r.obdWindowRemain  -= nSamples;
         if (r.obdWindowRemain <= 0) {
             r.obdWindowRemain = 0;
             r.obdOnsetActive  = false;
@@ -236,9 +243,10 @@ static void resetOBPOnGate(RangeT& r) noexcept
 #ifdef NEURALNOTE_ENABLE_MPM
     r.mpm.reset();
 #endif
-    r.obpHpsBits      = 0;
-    r.obdOnsetActive  = false;
-    r.obdWindowRemain = 0;
+    r.obpHpsBits       = 0;
+    r.obdOnsetActive   = false;
+    r.obdWindowRemain  = 0;
+    r.obdWindowElapsed = 0;
 }
 
 // ── OBP + HPS voting loop ─────────────────────────────────────────────────────
@@ -289,6 +297,16 @@ static int runOBPHPS(RangeT& r,
             (op >= r.cfg.midiLow && op <= r.cfg.midiHigh && op <= OBP_NOTE_CAP) ? op : -1);
 
         if (voted != -1) {
+            // ── minNoteLength gate ────────────────────────────────────────────
+            // If the note hasn't been held for minNoteLength yet, reset the
+            // voting buffer and keep listening rather than firing early.
+            if (r.obdWindowElapsed < r.obdMinDurationSamples) {
+                r.obdVoting.reset();
+                obpPtr += chunk;
+                obpRem -= chunk;
+                continue;
+            }
+
             // ── Layer 1: Cross-range harmonic suppression ─────────────────────
             bool isHarmonic = false;
             for (const auto& other : allRanges) {
