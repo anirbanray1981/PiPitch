@@ -308,21 +308,6 @@ static void runWorker(Monitor* m)
                     newVel[bit] = 100;
                 }
 
-                // Mid-note ±1 semitone suppression: on onset-dispatched
-                // snapshots, a ±1 semitone change is likely a transitional
-                // artifact (mixed old+new audio), not a real note change.
-                if (wasOnset && r.activeNotes && newBits
-                    && newBits != r.activeNotes) {
-                    const int active = NOTE_BASE + __builtin_ctzll(r.activeNotes);
-                    const int detect = NOTE_BASE + __builtin_ctzll(newBits);
-                    if (std::abs(detect - active) <= 1) {
-                        newBits = r.activeNotes;
-                        effectiveNote = active;
-                        for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
-                            newVel[__builtin_ctzll(tmp)] = 100;
-                    }
-                }
-
                 // From-silence onset grace: suppresses stale ring detections
                 // when no notes are active. Mid-note transitions use cancel grace.
                 if (wasOnset && r.swiftOnsetGrace <= 0) {
@@ -357,6 +342,28 @@ static void runWorker(Monitor* m)
                     if (elapsed > gate) {
                         newBits = 0;
                         effectiveNote = -1;
+                    }
+                }
+
+                // SwiftF0 note-change confirmation: require 2 consecutive cycles
+                // of the same new note before firing. Eliminates 1-cycle
+                // transitional half-steps (e.g. D#4 between E4→D4).
+                {
+                    const uint64_t playing = r.activeNotes | r.holdNotes;
+                    if (newBits && playing && newBits != r.activeNotes) {
+                        const int detected = NOTE_BASE + __builtin_ctzll(newBits);
+                        if (detected != r.swiftPendingNote) {
+                            r.swiftPendingNote = detected;
+                            newBits = r.activeNotes;
+                            effectiveNote = r.activeNotes
+                                ? NOTE_BASE + __builtin_ctzll(r.activeNotes) : -1;
+                            for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                                newVel[__builtin_ctzll(tmp)] = 100;
+                        } else {
+                            r.swiftPendingNote = -1;
+                        }
+                    } else {
+                        r.swiftPendingNote = -1;
                     }
                 }
 

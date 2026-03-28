@@ -242,20 +242,6 @@ static void runWorker(NeuralNotePlugin* self)
                     //   Mid-note: keep current note for 1 cycle (half-step suppression).
                     //   From silence: suppress cycle 1 and remember the stale note;
                     //     cycle 2 allows immediately if a DIFFERENT note is detected
-                    // Mid-note ±1 semitone suppression: on onset-dispatched
-                    // snapshots, a ±1 semitone change is likely a transitional
-                    // artifact (mixed old+new audio), not a real note change.
-                    if (wasOnset && r.activeNotes && newBits
-                        && newBits != r.activeNotes) {
-                        const int active = NOTE_BASE + __builtin_ctzll(r.activeNotes);
-                        const int detect = NOTE_BASE + __builtin_ctzll(newBits);
-                        if (std::abs(detect - active) <= 1) {
-                            newBits = r.activeNotes;
-                            for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
-                                newVel[__builtin_ctzll(tmp)] = 100;
-                        }
-                    }
-
                     // From-silence onset grace: suppresses stale ring detections
                     // when no notes are active. Mid-note transitions use cancel grace.
                     if (wasOnset && r.swiftOnsetGrace <= 0) {
@@ -287,6 +273,26 @@ static void runWorker(NeuralNotePlugin* self)
                         const auto gate = static_cast<uint64_t>(self->sampleRate * ONSET_GATE_S);
                         if (elapsed > gate)
                             newBits = 0;
+                    }
+
+                    // SwiftF0 note-change confirmation: require 2 consecutive cycles
+                    // of the same new note before firing. Eliminates 1-cycle
+                    // transitional half-steps (e.g. D#4 between E4→D4).
+                    {
+                        const uint64_t playing = r.activeNotes | r.holdNotes;
+                        if (newBits && playing && newBits != r.activeNotes) {
+                            const int detected = NOTE_BASE + __builtin_ctzll(newBits);
+                            if (detected != r.swiftPendingNote) {
+                                r.swiftPendingNote = detected;
+                                newBits = r.activeNotes;  // keep current (may be 0 if in hold)
+                                for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                                    newVel[__builtin_ctzll(tmp)] = 100;
+                            } else {
+                                r.swiftPendingNote = -1;
+                            }
+                        } else {
+                            r.swiftPendingNote = -1;
+                        }
                     }
                 } else {
                     r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),

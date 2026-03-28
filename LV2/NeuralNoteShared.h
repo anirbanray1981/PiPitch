@@ -246,6 +246,10 @@ struct RangeStateBase {
     int                 swiftOnsetGrace    = 0;
     int                 swiftGraceStaleNote = -1;  // note suppressed on grace cycle 1
 
+    // Worker-only: SwiftF0 note-change confirmation. New notes must be seen for
+    // 2 consecutive cycles before firing, eliminating 1-cycle transitional artifacts.
+    int                 swiftPendingNote   = -1;   // note awaiting confirmation (-1 = none)
+
     // Audio-thread: provisional cooldown prevents RMS re-trigger stutters.
     // After a provisional fires, same-note re-triggers are blocked for ~200ms.
     // Reset only by a tier-1 PICK onset (high-confidence new attack).
