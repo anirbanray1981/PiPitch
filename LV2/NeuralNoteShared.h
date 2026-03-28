@@ -251,6 +251,11 @@ struct RangeStateBase {
     int                 swiftPendingNote   = -1;   // note awaiting confirmation (-1 = none)
     int                 swiftPendingAge    = 0;    // cycles since pending was set
 
+    // Audio→worker: deferred provisional during note transitions.
+    // Set by fireProv when a different note is already active (transition mode).
+    // The worker uses this for consensus: SwiftF0 && transitionProv must agree.
+    std::atomic<int>    transitionProv{-1};
+
     // Audio-thread: provisional cooldown prevents RMS re-trigger stutters.
     // After a provisional fires, same-note re-triggers are blocked for ~200ms.
     // Reset only by a tier-1 PICK onset (high-confidence new attack).

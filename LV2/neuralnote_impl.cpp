@@ -282,7 +282,13 @@ static void runWorker(NeuralNotePlugin* self)
                         const uint64_t playing = r.activeNotes | r.holdNotes;
                         if (newBits && playing && newBits != r.activeNotes) {
                             const int detected = NOTE_BASE + __builtin_ctzll(newBits);
-                            if (detected == r.swiftPendingNote) {
+                            const int tp = r.transitionProv.load(std::memory_order_acquire);
+                            if (detected == tp) {
+                                // Consensus: SwiftF0 agrees with OBP/MPM → fire immediately
+                                r.transitionProv.store(-1, std::memory_order_release);
+                                r.swiftPendingNote = -1;
+                                r.swiftPendingAge  = 0;
+                            } else if (detected == r.swiftPendingNote) {
                                 // Second consecutive sighting — confirmed
                                 r.swiftPendingNote = -1;
                                 r.swiftPendingAge  = 0;
@@ -676,6 +682,13 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         // PICK-triggered re-hit: send OFF first for clean retrigger
                         writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                                   0x80, static_cast<uint8_t>(note), uint8_t(0));
+                    } else if (bits != 0) {
+                        // Transition: defer MIDI ON, store for SwiftF0 consensus.
+                        // Worker fires note-ON only if SwiftF0 agrees with this pitch.
+                        r.transitionProv.store(note, std::memory_order_release);
+                        r.provCooldownRemain = static_cast<int>(self->sampleRate * 0.2);
+                        r.provCooldownNote   = note;
+                        return;
                     }
                 }
                 // Mono / SwiftMono: kill any other range's held note

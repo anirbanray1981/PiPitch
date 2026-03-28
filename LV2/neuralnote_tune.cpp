@@ -352,7 +352,13 @@ static void runWorker(Monitor* m)
                     const uint64_t playing = r.activeNotes | r.holdNotes;
                     if (newBits && playing && newBits != r.activeNotes) {
                         const int detected = NOTE_BASE + __builtin_ctzll(newBits);
-                        if (detected == r.swiftPendingNote) {
+                        const int tp = r.transitionProv.load(std::memory_order_acquire);
+                        if (detected == tp) {
+                            // Consensus: SwiftF0 agrees with OBP/MPM → fire immediately
+                            r.transitionProv.store(-1, std::memory_order_release);
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        } else if (detected == r.swiftPendingNote) {
                             // Second consecutive sighting — confirmed
                             r.swiftPendingNote = -1;
                             r.swiftPendingAge  = 0;
@@ -517,6 +523,12 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                 for (auto& v : m->voices)
                     if (v.pitch == pp && v.state != 0 && v.state != 3)
                         v.state = 3;
+            } else if (bits != 0) {
+                // Transition: defer MIDI ON, store for SwiftF0 consensus.
+                rp.transitionProv.store(pp, std::memory_order_release);
+                rp.provCooldownRemain = static_cast<int>(m->sampleRate * 0.2);
+                rp.provCooldownNote   = pp;
+                continue;
             }
         }
 
