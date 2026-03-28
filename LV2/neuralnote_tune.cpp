@@ -488,12 +488,21 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         if (pp == -1) continue;
         rp.provMidiPitch = -1;
 
-        // Check if a lower range already fired something this onset that makes this one
-        // a harmonic (diff 12 or 24) or an adjacent-frequency artefact (diff ≤ 1).
+        // Skip if the same note is already active — avoids redundant re-triggers
+        // from RMS onset re-fires on the same note's energy.
+        if (pp >= NOTE_BASE && pp < NOTE_BASE + NOTE_COUNT) {
+            const uint64_t bits = rp.activeNotesBits.load(std::memory_order_acquire);
+            if (bits & (1ULL << (pp - NOTE_BASE))) continue;
+        }
+
+        // Mono: suppress if ANY other range already fired a provisional this onset.
+        // Poly: suppress harmonics (diff 12/24) and adjacent artefacts (diff ≤ 5).
+        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
         bool suppressed = false;
         for (int j = 0; j < ri && !suppressed; ++j) {
             const int pj = m->onsetProvNotes[j];
             if (pj == -1) continue;
+            if (mono) { suppressed = true; break; }
             const int diff = pp - pj;
             if (diff == 12 || diff == 24 || std::abs(diff) <= 5)
                 suppressed = true;
@@ -719,24 +728,49 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                     midiToName(finalNote).c_str(), finalNote,
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
-                    } else if (mpmNote != finalNote) {
-                        std::printf("[+%.3fs]  --   MPM disagrees (fill %d):"
-                                    "  OBP→%-4s(%d)  MPM→%-4s(%d)  suppressed  [range %s]\n",
-                                    elapsed, mpmFill,
-                                    midiToName(finalNote).c_str(), finalNote,
-                                    midiToName(mpmNote).c_str(), mpmNote,
-                                    r.cfg.name.c_str());
-                        std::fflush(stdout);
                     } else {
-                        std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
-                                    "  prov fired  [range %s]\n",
-                                    elapsed, mpmFill,
-                                    midiToName(finalNote).c_str(), finalNote,
-                                    r.cfg.name.c_str());
-                        std::fflush(stdout);
-                        r.provMidiPitch = finalNote;
-                        r.provNote.store(finalNote, std::memory_order_release);
-                        r.monoHeldNote.store(finalNote, std::memory_order_release);
+                        // OBP confirms onset; trust MPM for the pitch.
+                        // Mono: suppress if any other range already has a provisional.
+                        // Poly: suppress harmonics (±12/24 semitones).
+                        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
+                        bool mpmHarmonic = false;
+                        for (const auto& orp : m->ranges) {
+                            if (orp.get() == &r) continue;
+                            const int op2 = orp->provNote.load(std::memory_order_relaxed);
+                            if (op2 != -1) {
+                                if (mono) { mpmHarmonic = true; break; }
+                                const int ad = std::abs(mpmNote - op2);
+                                if (ad == 12 || ad == 24) { mpmHarmonic = true; break; }
+                            }
+                        }
+                        if (mpmHarmonic) {
+                            std::printf("[+%.3fs]  --   MPM→%-4s(%d) suppressed (mono/harmonic)"
+                                        "  [range %s]\n",
+                                        elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                        } else {
+                            const int provPitch = mpmNote;
+                            if (mpmNote != finalNote) {
+                                std::printf("[+%.3fs]  --   MPM corrects OBP (fill %d):"
+                                            "  OBP→%-4s(%d)  MPM→%-4s(%d)"
+                                            "  prov fired  [range %s]\n",
+                                            elapsed, mpmFill,
+                                            midiToName(finalNote).c_str(), finalNote,
+                                            midiToName(mpmNote).c_str(), mpmNote,
+                                            r.cfg.name.c_str());
+                            } else {
+                                std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
+                                            "  prov fired  [range %s]\n",
+                                            elapsed, mpmFill,
+                                            midiToName(provPitch).c_str(), provPitch,
+                                            r.cfg.name.c_str());
+                            }
+                            std::fflush(stdout);
+                            r.provMidiPitch = provPitch;
+                            r.provNote.store(provPitch, std::memory_order_release);
+                            r.monoHeldNote.store(provPitch, std::memory_order_release);
+                        }
                     }
                 }
             }
@@ -762,22 +796,42 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                     const double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - m->startTime).count();
                     r.obdPendingNote = -1;
-                    if (mpmNote == pending) {
-                        std::printf("[+%.3fs]  --   MPM confirmed pending OBP→%-4s(%d)"
-                                    "  (fill %d)  prov fired  [range %s]\n",
-                                    elapsed, midiToName(pending).c_str(), pending,
-                                    mpmFill, r.cfg.name.c_str());
+                    // Mono: suppress if any other range has a provisional.
+                    // Poly: suppress harmonics (±12/24).
+                    const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
+                    bool mpmHarmonic = false;
+                    for (const auto& orp : m->ranges) {
+                        if (orp.get() == &r) continue;
+                        const int op2 = orp->provNote.load(std::memory_order_relaxed);
+                        if (op2 != -1) {
+                            if (mono) { mpmHarmonic = true; break; }
+                            const int ad = std::abs(mpmNote - op2);
+                            if (ad == 12 || ad == 24) { mpmHarmonic = true; break; }
+                        }
+                    }
+                    if (mpmHarmonic) {
+                        std::printf("[+%.3fs]  --   MPM→%-4s(%d) suppressed (mono/harmonic)"
+                                    "  [range %s]\n",
+                                    elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                    r.cfg.name.c_str());
                         std::fflush(stdout);
-                        r.provMidiPitch = pending;
-                        r.provNote.store(pending, std::memory_order_release);
-                        r.monoHeldNote.store(pending, std::memory_order_release);
                     } else {
-                        std::printf("[+%.3fs]  --   MPM suppressed pending OBP→%-4s(%d)"
-                                    "  MPM→%-4s(%d)  (fill %d)  [range %s]\n",
-                                    elapsed, midiToName(pending).c_str(), pending,
-                                    midiToName(mpmNote).c_str(), mpmNote,
-                                    mpmFill, r.cfg.name.c_str());
+                        if (mpmNote != pending) {
+                            std::printf("[+%.3fs]  --   MPM corrects pending OBP→%-4s(%d)"
+                                        "  MPM→%-4s(%d)  (fill %d)  prov fired  [range %s]\n",
+                                        elapsed, midiToName(pending).c_str(), pending,
+                                        midiToName(mpmNote).c_str(), mpmNote,
+                                        mpmFill, r.cfg.name.c_str());
+                        } else {
+                            std::printf("[+%.3fs]  --   MPM confirmed pending OBP→%-4s(%d)"
+                                        "  (fill %d)  prov fired  [range %s]\n",
+                                        elapsed, midiToName(pending).c_str(), pending,
+                                        mpmFill, r.cfg.name.c_str());
+                        }
                         std::fflush(stdout);
+                        r.provMidiPitch = mpmNote;
+                        r.provNote.store(mpmNote, std::memory_order_release);
+                        r.monoHeldNote.store(mpmNote, std::memory_order_release);
                     }
                 }
                 // mpmNote == -1: still not ready, try again next callback

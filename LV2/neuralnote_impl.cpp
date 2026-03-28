@@ -628,13 +628,15 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
             // Helper: fire a provisional note — shared by immediate and pending paths.
             auto fireProv = [&](int note) {
-                // Re-hit: if the note is already active (confirmed by the worker),
-                // send a note-OFF first so the downstream synth retriggering cleanly.
+                // Skip if the same note is already active — avoids redundant
+                // re-triggers from RMS onset re-fires on the same note's energy.
+                // Genuine staccato re-hits are detected by the pick detector
+                // which resets the onset cycle; the worker's applyNotesDiff
+                // handles the actual OFF+ON via the hold/re-hit path.
                 if (note >= NOTE_BASE && note < NOTE_BASE + NOTE_COUNT) {
                     const uint64_t bits = r.activeNotesBits.load(std::memory_order_acquire);
                     if (bits & (1ULL << (note - NOTE_BASE)))
-                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                                  0x80, static_cast<uint8_t>(note), uint8_t(0));
+                        return;  // note already playing — skip redundant provisional
                 }
                 // Mono / SwiftMono: kill any other range's held note
                 if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
@@ -672,14 +674,30 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         const int mpmNote = r.mpm.analyze(
                             static_cast<float>(self->sampleRate),
                             r.cfg.midiLow, r.cfg.midiHigh);
-                        if (mpmNote != -1 && mpmNote == finalNote) {
-                            shouldFire = true;
-                        } else if (mpmNote == -1) {
+                        if (mpmNote != -1) {
+                            // OBP confirms onset; trust MPM for the pitch.
+                            // Mono: suppress if any other range already has a provisional.
+                            // Poly: suppress if MPM's note is a harmonic (±12/24 semitones).
+                            const bool mono = (self->modeVal.load(std::memory_order_relaxed) >= 1);
+                            bool suppress = false;
+                            for (int oi = 0; oi < static_cast<int>(self->ranges.size()); ++oi) {
+                                if (oi == ri) continue;
+                                const int op2 = self->ranges[oi]->provNote.load(std::memory_order_relaxed);
+                                if (op2 != -1) {
+                                    if (mono) { suppress = true; break; }
+                                    const int ad = std::abs(mpmNote - op2);
+                                    if (ad == 12 || ad == 24) { suppress = true; break; }
+                                }
+                            }
+                            if (!suppress) {
+                                shouldFire = true;
+                                finalNote  = mpmNote;
+                            }
+                        } else {
                             // MPM not ready — save vote and retry next callbacks
                             r.obdPendingNote   = finalNote;
                             r.obdPendingRemain = static_cast<int>(self->sampleRate * 0.1f);
                         }
-                        // mpmNote disagrees: suppressed, no pending
 #else
                         shouldFire = true;
 #endif
@@ -700,10 +718,21 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         static_cast<float>(self->sampleRate),
                         r.cfg.midiLow, r.cfg.midiHigh);
                     if (mpmNote != -1) {
-                        const int pending = r.obdPendingNote;
                         r.obdPendingNote = -1;
-                        if (mpmNote == pending) fireProv(pending);
-                        // mpmNote disagrees: suppressed
+                        // Mono: suppress if any other range has a provisional.
+                        // Poly: suppress harmonics (±12/24).
+                        const bool mono = (self->modeVal.load(std::memory_order_relaxed) >= 1);
+                        bool suppress = false;
+                        for (int oi = 0; oi < static_cast<int>(self->ranges.size()); ++oi) {
+                            if (&*self->ranges[oi] == &r) continue;
+                            const int op2 = self->ranges[oi]->provNote.load(std::memory_order_relaxed);
+                            if (op2 != -1) {
+                                if (mono) { suppress = true; break; }
+                                const int ad = std::abs(mpmNote - op2);
+                                if (ad == 12 || ad == 24) { suppress = true; break; }
+                            }
+                        }
+                        if (!suppress) fireProv(mpmNote);
                     }
                     // mpmNote == -1: still not ready, try again next callback
                 }

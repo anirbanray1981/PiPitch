@@ -392,13 +392,14 @@ static int runOBPHPS(RangeT& r,
 
         if (voted != -1) {
             // ── Layer 1: Cross-range harmonic suppression ─────────────────────
+            // Check both harmonics (voted above prov) and sub-harmonics (voted below).
             bool isHarmonic = false;
             for (const auto& other : allRanges) {
                 if (other.get() == &r) continue;
                 const int op2 = other->provNote.load(std::memory_order_relaxed);
                 if (op2 != -1) {
-                    const int diff = voted - op2;
-                    if (diff == 12 || diff == 24) { isHarmonic = true; break; }
+                    const int absDiff = std::abs(voted - op2);
+                    if (absDiff == 12 || absDiff == 24) { isHarmonic = true; break; }
                 }
             }
 
