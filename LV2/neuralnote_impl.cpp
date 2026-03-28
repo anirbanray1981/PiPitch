@@ -241,18 +241,14 @@ static void runWorker(NeuralNotePlugin* self)
                     //   Mid-note: keep current note for 1 cycle (half-step suppression).
                     //   From silence: suppress cycle 1 and remember the stale note;
                     //     cycle 2 allows immediately if a DIFFERENT note is detected
-                    //     (it's the real new note), or suppresses if same stale note.
+                    // From-silence onset grace: suppresses stale ring detections
+                    // when no notes are active. Mid-note transitions use cancel grace.
                     if (wasOnset && r.swiftOnsetGrace <= 0) {
                         r.swiftOnsetGrace = 2;
                         r.swiftGraceStaleNote = -1;
                     }
                     if (r.swiftOnsetGrace > 0) {
-                        if (r.activeNotes && newBits && newBits != r.activeNotes) {
-                            // Mid-note transition: wrong note → keep current
-                            newBits = r.activeNotes;
-                            for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
-                                newVel[__builtin_ctzll(tmp)] = 100;
-                        } else if (!r.activeNotes && newBits) {
+                        if (!r.activeNotes && newBits) {
                             const int detected = NOTE_BASE + __builtin_ctzll(newBits);
                             if (r.swiftGraceStaleNote < 0) {
                                 r.swiftGraceStaleNote = detected;
@@ -583,6 +579,11 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
     if (pickSample >= 0 && (pickRatio >= PICK_HIGH_TIER || rmsWouldFire)) {
         onsetFired = true;
+        // Tier-1 PICK: reset provisional cooldowns (genuine new attack)
+        if (pickRatio >= PICK_HIGH_TIER) {
+            for (auto& rp2 : self->ranges)
+                { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
+        }
         const float blankMs = (self->onsetBlankMsPort && *self->onsetBlankMsPort > 0.0f)
                                   ? *self->onsetBlankMsPort : ONSET_BLANK_MS;
         self->onsetBlankRemain = static_cast<int>(self->sampleRate * (blankMs / 1000.0f));
@@ -624,18 +625,21 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             armOrExpireOBP(r, static_cast<float>(self->sampleRate),
                            static_cast<int>(nSamples), onsetFired);
 
+            // Decrement provisional cooldown
+            if (r.provCooldownRemain > 0)
+                r.provCooldownRemain -= static_cast<int>(nSamples);
+
             // Helper: fire a provisional note — shared by immediate and pending paths.
             auto fireProv = [&](int note) {
-                // Skip if the same note is already active — avoids redundant
-                // re-triggers from RMS onset re-fires on the same note's energy.
-                // Genuine staccato re-hits are detected by the pick detector
-                // which resets the onset cycle; the worker's applyNotesDiff
-                // handles the actual OFF+ON via the hold/re-hit path.
+                // Skip if the same note is already active
                 if (note >= NOTE_BASE && note < NOTE_BASE + NOTE_COUNT) {
                     const uint64_t bits = r.activeNotesBits.load(std::memory_order_acquire);
                     if (bits & (1ULL << (note - NOTE_BASE)))
-                        return;  // note already playing — skip redundant provisional
+                        return;
                 }
+                // Skip if same note is under cooldown (RMS re-trigger suppression)
+                if (r.provCooldownRemain > 0 && note == r.provCooldownNote)
+                    return;
                 // Mono / SwiftMono: kill any other range's held note
                 if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
                     for (auto& other : self->ranges) {
@@ -651,6 +655,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                           0x90, static_cast<uint8_t>(note), uint8_t(100));
                 r.provNote.store(note, std::memory_order_release);
                 r.monoHeldNote.store(note, std::memory_order_release);
+                r.provCooldownRemain = static_cast<int>(self->sampleRate * 0.2);
+                r.provCooldownNote   = note;
             };
 
 #ifdef NEURALNOTE_ENABLE_MPM

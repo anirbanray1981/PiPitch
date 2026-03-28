@@ -246,6 +246,12 @@ struct RangeStateBase {
     int                 swiftOnsetGrace    = 0;
     int                 swiftGraceStaleNote = -1;  // note suppressed on grace cycle 1
 
+    // Audio-thread: provisional cooldown prevents RMS re-trigger stutters.
+    // After a provisional fires, same-note re-triggers are blocked for ~200ms.
+    // Reset only by a tier-1 PICK onset (high-confidence new attack).
+    int                 provCooldownRemain = 0;    // samples remaining
+    int                 provCooldownNote   = -1;   // MIDI note under cooldown
+
 #ifdef NEURALNOTE_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
 #endif

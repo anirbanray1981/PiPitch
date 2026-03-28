@@ -307,24 +307,14 @@ static void runWorker(Monitor* m)
                     newVel[bit] = 100;
                 }
 
-                // Onset-transition grace: the first snapshot(s) after an onset
-                // contain stale ring audio.  Two cases:
-                //   Mid-note: keep current note for 1 cycle (half-step suppression).
-                //   From silence: suppress cycle 1 and remember the stale note;
-                //     cycle 2 allows immediately if a DIFFERENT note is detected
-                //     (it's the real new note), or suppresses if same stale note.
+                // From-silence onset grace: suppresses stale ring detections
+                // when no notes are active. Mid-note transitions use cancel grace.
                 if (wasOnset && r.swiftOnsetGrace <= 0) {
                     r.swiftOnsetGrace = 2;
                     r.swiftGraceStaleNote = -1;
                 }
                 if (r.swiftOnsetGrace > 0) {
-                    if (r.activeNotes && newBits && newBits != r.activeNotes) {
-                        // Mid-note transition: wrong note → keep current
-                        newBits = r.activeNotes;
-                        effectiveNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
-                        for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
-                            newVel[__builtin_ctzll(tmp)] = 100;
-                    } else if (!r.activeNotes && newBits) {
+                    if (!r.activeNotes && newBits) {
                         const int detected = NOTE_BASE + __builtin_ctzll(newBits);
                         if (r.swiftGraceStaleNote < 0) {
                             r.swiftGraceStaleNote = detected;
@@ -492,6 +482,9 @@ static void processSynth(Monitor* m, float* out, int nFrames)
             if (bits & (1ULL << (pp - NOTE_BASE))) continue;
         }
 
+        // Skip if same note under cooldown (RMS re-trigger suppression)
+        if (rp.provCooldownRemain > 0 && pp == rp.provCooldownNote) continue;
+
         // Mono: suppress if ANY other range already fired a provisional this onset.
         // Poly: suppress harmonics (diff 12/24) and adjacent artefacts (diff ≤ 5).
         const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
@@ -553,6 +546,8 @@ static void processSynth(Monitor* m, float* out, int nFrames)
             if (l < bestLevel) { bestLevel = l; best = i; }
         }
         m->voices[best] = { pp, midiToFreq(pp), 0.0, 100.0f / 127.0f, 1, 0.0f };
+        rp.provCooldownRemain = static_cast<int>(m->sampleRate * 0.2);
+        rp.provCooldownNote   = pp;
     }
 
     // Drain all ranges' MIDI output queues — lockless
@@ -639,6 +634,11 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 
     if (pickSample >= 0 && (pickRatioVal >= PICK_HIGH_TIER || rmsWouldFire)) {
         onsetFired          = true;
+        // Tier-1 PICK: reset provisional cooldowns (genuine new attack)
+        if (pickRatioVal >= PICK_HIGH_TIER) {
+            for (auto& rp2 : m->ranges)
+                { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
+        }
         m->onsetBlankRemain = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
         m->onsetSmoothedRms = blockRms;
         m->lastOnsetSample.store(
@@ -691,6 +691,10 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         // Two-phase OneBitPitch + MPM: arm on onset, expire after 100 ms.
         armOrExpireOBP(r, static_cast<float>(m->sampleRate),
                        static_cast<int>(nFrames), onsetFired);
+
+        // Decrement provisional cooldown
+        if (r.provCooldownRemain > 0)
+            r.provCooldownRemain -= static_cast<int>(nFrames);
 
         // Push to MPM while OBP window is active OR while awaiting MPM on a pending vote.
         if (!gated && (r.obdOnsetActive || r.obdPendingNote != -1))
