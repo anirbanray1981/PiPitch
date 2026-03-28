@@ -241,6 +241,20 @@ static void runWorker(NeuralNotePlugin* self)
                     //   Mid-note: keep current note for 1 cycle (half-step suppression).
                     //   From silence: suppress cycle 1 and remember the stale note;
                     //     cycle 2 allows immediately if a DIFFERENT note is detected
+                    // Mid-note ±1 semitone suppression: on onset-dispatched
+                    // snapshots, a ±1 semitone change is likely a transitional
+                    // artifact (mixed old+new audio), not a real note change.
+                    if (wasOnset && r.activeNotes && newBits
+                        && newBits != r.activeNotes) {
+                        const int active = NOTE_BASE + __builtin_ctzll(r.activeNotes);
+                        const int detect = NOTE_BASE + __builtin_ctzll(newBits);
+                        if (std::abs(detect - active) <= 1) {
+                            newBits = r.activeNotes;
+                            for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                                newVel[__builtin_ctzll(tmp)] = 100;
+                        }
+                    }
+
                     // From-silence onset grace: suppresses stale ring detections
                     // when no notes are active. Mid-note transitions use cancel grace.
                     if (wasOnset && r.swiftOnsetGrace <= 0) {
@@ -297,7 +311,7 @@ static void runWorker(NeuralNotePlugin* self)
                         if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
                             --r.provCancelGrace;
                             newBits    |= (1ULL << bit);  // suppress cancel; note already playing
-                            newVel[bit] = 64;             // velocity unused (no new note-ON fired)
+                            newVel[bit] = 127;            // max velocity so prov wins mono reduction
                         } else {
                             r.provCancelGrace = 0;  // CNN confirmed naturally
                         }

@@ -307,6 +307,21 @@ static void runWorker(Monitor* m)
                     newVel[bit] = 100;
                 }
 
+                // Mid-note ±1 semitone suppression: on onset-dispatched
+                // snapshots, a ±1 semitone change is likely a transitional
+                // artifact (mixed old+new audio), not a real note change.
+                if (wasOnset && r.activeNotes && newBits
+                    && newBits != r.activeNotes) {
+                    const int active = NOTE_BASE + __builtin_ctzll(r.activeNotes);
+                    const int detect = NOTE_BASE + __builtin_ctzll(newBits);
+                    if (std::abs(detect - active) <= 1) {
+                        newBits = r.activeNotes;
+                        effectiveNote = active;
+                        for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                            newVel[__builtin_ctzll(tmp)] = 100;
+                    }
+                }
+
                 // From-silence onset grace: suppresses stale ring detections
                 // when no notes are active. Mid-note transitions use cancel grace.
                 if (wasOnset && r.swiftOnsetGrace <= 0) {
@@ -388,7 +403,7 @@ static void runWorker(Monitor* m)
                     if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
                         --r.provCancelGrace;
                         newBits    |= (1ULL << bit);  // suppress cancel; note already playing
-                        newVel[bit] = 64;             // velocity unused (no new note-ON fired)
+                        newVel[bit] = 127;            // max velocity so prov wins mono reduction
                     } else {
                         r.provCancelGrace = 0;  // confirmed naturally
                     }
@@ -485,9 +500,10 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         // Skip if same note under cooldown (RMS re-trigger suppression)
         if (rp.provCooldownRemain > 0 && pp == rp.provCooldownNote) continue;
 
+        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
+
         // Mono: suppress if ANY other range already fired a provisional this onset.
         // Poly: suppress harmonics (diff 12/24) and adjacent artefacts (diff ≤ 5).
-        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
         bool suppressed = false;
         for (int j = 0; j < ri && !suppressed; ++j) {
             const int pj = m->onsetProvNotes[j];
