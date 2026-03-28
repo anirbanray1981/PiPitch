@@ -142,6 +142,7 @@ struct NeuralNotePlugin {
 
     // HPF pick detector (run() thread only)
     PickDetector pickDetector;
+    int          pickFiredRemain = 0;  // samples remaining since last PICK; >0 = recent pick
 
     // Onset-recency tracking (audio → worker, for decay-tail ghost suppression)
     std::atomic<uint64_t> totalSamples{0};
@@ -576,6 +577,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
     // Onset detection: HPF pick detector is primary, RMS is fallback.
     self->totalSamples.fetch_add(nSamples, std::memory_order_relaxed);
+    if (self->pickFiredRemain > 0)
+        self->pickFiredRemain -= static_cast<int>(nSamples);
     bool onsetFired = false;
 
     // Primary: HPF pick detector with two-tier confirmation.
@@ -593,11 +596,12 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
     if (pickSample >= 0 && (pickRatio >= PICK_HIGH_TIER || rmsWouldFire)) {
         onsetFired = true;
-        // Tier-1 PICK: reset provisional cooldowns (genuine new attack)
-        if (pickRatio >= PICK_HIGH_TIER) {
-            for (auto& rp2 : self->ranges)
-                { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
-        }
+        // Any PICK: reset provisional cooldowns (genuine new attack).
+        // The PICK detector's 25ms internal blank prevents double-firing on the
+        // same pick's energy, so if PICK fires again it's a real re-hit.
+        for (auto& rp2 : self->ranges)
+            { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
+        self->pickFiredRemain = static_cast<int>(self->sampleRate * 0.05);  // 50ms window
         const float blankMs = (self->onsetBlankMsPort && *self->onsetBlankMsPort > 0.0f)
                                   ? *self->onsetBlankMsPort : ONSET_BLANK_MS;
         self->onsetBlankRemain = static_cast<int>(self->sampleRate * (blankMs / 1000.0f));
@@ -645,15 +649,20 @@ static void run(LV2_Handle instance, uint32_t nSamples)
 
             // Helper: fire a provisional note — shared by immediate and pending paths.
             auto fireProv = [&](int note) {
-                // Skip if the same note is already active
-                if (note >= NOTE_BASE && note < NOTE_BASE + NOTE_COUNT) {
-                    const uint64_t bits = r.activeNotesBits.load(std::memory_order_acquire);
-                    if (bits & (1ULL << (note - NOTE_BASE)))
-                        return;
-                }
                 // Skip if same note is under cooldown (RMS re-trigger suppression)
                 if (r.provCooldownRemain > 0 && note == r.provCooldownNote)
                     return;
+                // Same note already active: re-hit (OFF+ON) if PICK fired this
+                // callback (cooldown was just reset), else skip (RMS re-trigger).
+                if (note >= NOTE_BASE && note < NOTE_BASE + NOTE_COUNT) {
+                    const uint64_t bits = r.activeNotesBits.load(std::memory_order_acquire);
+                    if (bits & (1ULL << (note - NOTE_BASE))) {
+                        if (self->pickFiredRemain <= 0) return;  // no recent PICK → skip
+                        // PICK-triggered re-hit: send OFF first for clean retrigger
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  0x80, static_cast<uint8_t>(note), uint8_t(0));
+                    }
+                }
                 // Mono / SwiftMono: kill any other range's held note
                 if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
                     for (auto& other : self->ranges) {

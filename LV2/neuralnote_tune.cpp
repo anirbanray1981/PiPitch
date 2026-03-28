@@ -148,6 +148,7 @@ struct Monitor {
 
     // HPF pick detector (jackProcess thread only)
     PickDetector pickDetector;
+    int          pickFiredRemain = 0;  // samples remaining since last PICK; >0 = recent pick
 
     // Onset-recency tracking (audio → worker, for decay-tail ghost suppression)
     std::atomic<uint64_t> totalSamples{0};
@@ -490,11 +491,17 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         if (pp == -1) continue;
         rp.provMidiPitch = -1;
 
-        // Skip if the same note is already active — avoids redundant re-triggers
-        // from RMS onset re-fires on the same note's energy.
+        // Same note already active: re-hit (release+restart) if PICK fired this
+        // callback (genuine re-pick), else skip (RMS re-trigger artifact).
         if (pp >= NOTE_BASE && pp < NOTE_BASE + NOTE_COUNT) {
             const uint64_t bits = rp.activeNotesBits.load(std::memory_order_acquire);
-            if (bits & (1ULL << (pp - NOTE_BASE))) continue;
+            if (bits & (1ULL << (pp - NOTE_BASE))) {
+                if (m->pickFiredRemain <= 0) continue;
+                // PICK-triggered re-hit: release existing voice for clean retrigger
+                for (auto& v : m->voices)
+                    if (v.pitch == pp && v.state != 0 && v.state != 3)
+                        v.state = 3;
+            }
         }
 
         // Skip if same note under cooldown (RMS re-trigger suppression)
@@ -635,6 +642,8 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     // Onset detection: HPF pick detector is primary, RMS is fallback.
     m->totalSamples.fetch_add(nFrames, std::memory_order_relaxed);
     bool onsetFired = false;
+    if (m->pickFiredRemain > 0)
+        m->pickFiredRemain -= static_cast<int>(nFrames);
 
     // Primary: HPF pick detector with two-tier confirmation.
     //   Tier 1 (ratio ≥ 10): high confidence — immediate onset.
@@ -650,11 +659,10 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 
     if (pickSample >= 0 && (pickRatioVal >= PICK_HIGH_TIER || rmsWouldFire)) {
         onsetFired          = true;
-        // Tier-1 PICK: reset provisional cooldowns (genuine new attack)
-        if (pickRatioVal >= PICK_HIGH_TIER) {
-            for (auto& rp2 : m->ranges)
-                { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
-        }
+        // Any PICK: reset provisional cooldowns (genuine new attack).
+        for (auto& rp2 : m->ranges)
+            { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
+        m->pickFiredRemain = static_cast<int>(m->sampleRate * 0.05);  // 50ms window
         m->onsetBlankRemain = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
         m->onsetSmoothedRms = blockRms;
         m->lastOnsetSample.store(
