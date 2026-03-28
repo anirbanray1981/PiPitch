@@ -249,6 +249,7 @@ struct RangeStateBase {
     // Worker-only: SwiftF0 note-change confirmation. New notes must be seen for
     // 2 consecutive cycles before firing, eliminating 1-cycle transitional artifacts.
     int                 swiftPendingNote   = -1;   // note awaiting confirmation (-1 = none)
+    int                 swiftPendingAge    = 0;    // cycles since pending was set
 
     // Audio-thread: provisional cooldown prevents RMS re-trigger stutters.
     // After a provisional fires, same-note re-triggers are blocked for ~200ms.

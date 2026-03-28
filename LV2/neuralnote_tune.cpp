@@ -352,18 +352,27 @@ static void runWorker(Monitor* m)
                     const uint64_t playing = r.activeNotes | r.holdNotes;
                     if (newBits && playing && newBits != r.activeNotes) {
                         const int detected = NOTE_BASE + __builtin_ctzll(newBits);
-                        if (detected != r.swiftPendingNote) {
+                        if (detected == r.swiftPendingNote) {
+                            // Second consecutive sighting — confirmed
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        } else if (r.swiftPendingAge < 3) {
+                            // First sighting or different note — suppress
                             r.swiftPendingNote = detected;
+                            ++r.swiftPendingAge;
                             newBits = r.activeNotes;
                             effectiveNote = r.activeNotes
                                 ? NOTE_BASE + __builtin_ctzll(r.activeNotes) : -1;
                             for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
                                 newVel[__builtin_ctzll(tmp)] = 100;
                         } else {
+                            // Pending expired (oscillating too long) — allow through
                             r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
                         }
                     } else {
                         r.swiftPendingNote = -1;
+                        r.swiftPendingAge  = 0;
                     }
                 }
 
