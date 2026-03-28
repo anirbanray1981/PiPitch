@@ -306,6 +306,9 @@ if(BUILD_LV2)
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_LIST_DIR}/Lib/ModelData
             ${LV2_BUNDLE_DIR}/ModelData
+        COMMAND ${CMAKE_COMMAND} -E copy
+            ${CMAKE_CURRENT_LIST_DIR}/LV2/swift_f0_model.onnx
+            ${LV2_BUNDLE_DIR}/swift_f0_model.onnx
         COMMENT "Assembling LV2 bundle: ${LV2_BUNDLE_DIR}"
     )
 

@@ -50,6 +50,7 @@
 #include "BasicPitchConstants.h"
 #include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
                                // OneBitPitchDetector.h, McLeodPitchDetector.h
+#include "SwiftF0Detector.h"
 
 // ── tune-only constants ────────────────────────────────────────────────────────
 
@@ -112,8 +113,9 @@ struct SynthVoice {
 
 struct RangeState : RangeStateBase {
     // tune-specific fields
-    int    provMidiPitch = -1;   // set by OBP, consumed by processSynth this callback
-    double provOnTimeMs  = 0.0;  // ms since startTime when provisional fired
+    int    provMidiPitch    = -1;   // set by OBP, consumed by processSynth this callback
+    double provOnTimeMs     = 0.0;  // ms since startTime when provisional fired
+    int    lastSwiftPrint   = -2;   // last SwiftF0 note printed (-1=silent, -2=none yet)
 };
 
 // ── Shared state ───────────────────────────────────────────────────────────────
@@ -144,9 +146,21 @@ struct Monitor {
     float onsetBlankMs     = 25.0f;  // re-trigger suppression window (ms)
     int   onsetBlankRemain = 0;      // raw input samples remaining in blank period
 
+    // HPF pick detector (jackProcess thread only)
+    PickDetector pickDetector;
+    int          pickFiredRemain = 0;  // samples remaining since last PICK; >0 = recent pick
+
+    // Onset-recency tracking (audio → worker, for decay-tail ghost suppression)
+    std::atomic<uint64_t> totalSamples{0};
+    std::atomic<uint64_t> lastOnsetSample{0};
+
     // Per-range OBP provisional note fired this onset (-1 if none); cleared on each onset.
     // Used for cross-range harmonic suppression.
     std::array<int, 8> onsetProvNotes = {-1,-1,-1,-1,-1,-1,-1,-1};
+
+    std::unique_ptr<SwiftF0Detector> swiftF0;         // null if model not found
+    float                            swiftF0Threshold = 0.5f;
+    std::vector<float>               sf0Buf;          // worker-thread scratch: 16 kHz audio
 
     // Single worker thread shared across all ranges
     std::thread       workerThread;
@@ -223,21 +237,17 @@ static void runWorker(Monitor* m)
         sem_wait(&m->workerSem);
         if (m->workerQuit.load(std::memory_order_acquire)) break;
 
-        const bool mono = (m->mode == PlayMode::MONO);
+        const bool swiftMono = (m->mode == PlayMode::SWIFT_MONO && m->swiftF0 != nullptr);
+        const bool mono      = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
 
         for (int ri = 0; ri < static_cast<int>(m->ranges.size()); ++ri) {
             RangeState& r = *m->ranges[ri];
             if (!r.snapChan.ready.load(std::memory_order_acquire)) continue;
 
+            // Always update BasicPitch params (no-op in swiftmono but keeps state clean).
             const float minDurMs = r.cfg.minNoteLength * FFT_HOP
                                    / static_cast<float>(PLUGIN_SR) * 1000.0f;
             r.basicPitch->setParameters(1.0f - m->frameThreshold, m->threshold, minDurMs);
-
-            const auto t0 = std::chrono::steady_clock::now();
-            r.basicPitch->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
-            r.snapChan.ready.store(false, std::memory_order_release);
-            const double inferMs = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count();
 
             // Two-phase: insert provisional into activeNotes before diff.
             // Staleness check: if a new provisional has fired since this snapshot
@@ -261,32 +271,197 @@ static void runWorker(Monitor* m)
                 // If stale: leave provNote intact; provForDiff stays -1.
             }
 
-            const uint64_t prevActive = r.activeNotes;
             uint64_t newBits = 0;
             int8_t   newVel[NOTE_COUNT] = {};
-            buildNNBits(r, m->ampFloor, newBits, newVel);
+            double   inferMs = 0.0;
 
-            // Cancel grace: first CNN cycle after a new provisional fires often
+            if (swiftMono) {
+                // SwiftF0 path: resample snapshot 22050→16000 Hz, run inference.
+                const float* src    = r.snapChan.data.data();
+                const int    srcLen = r.snapChan.snapshotSize;
+                const bool   wasOnset = r.snapChan.onsetDispatched;
+                constexpr double SF0_SR = 16000.0;
+                const double ratio  = SF0_SR / PLUGIN_SR;
+                const int    dstLen = static_cast<int>(srcLen * ratio);
+                m->sf0Buf.resize(dstLen);
+                for (int i = 0; i < dstLen; ++i) {
+                    const double pos = i / ratio;
+                    const int    s0  = static_cast<int>(pos);
+                    const double f   = pos - s0;
+                    const int    s1  = std::min(s0 + 1, srcLen - 1);
+                    m->sf0Buf[i]     = static_cast<float>((1.0 - f) * src[s0] + f * src[s1]);
+                }
+                r.snapChan.ready.store(false, std::memory_order_release);
+
+                const auto t0 = std::chrono::steady_clock::now();
+                const int midiNote = m->swiftF0->infer(
+                    m->sf0Buf.data(), dstLen, m->swiftF0Threshold);
+                inferMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+
+                int effectiveNote = -1;  // -1 = silent
+                if (midiNote >= r.cfg.midiLow && midiNote <= r.cfg.midiHigh &&
+                    midiNote >= NOTE_BASE && midiNote < NOTE_BASE + NOTE_COUNT) {
+                    effectiveNote = midiNote;
+                    const int bit = midiNote - NOTE_BASE;
+                    newBits    = 1ULL << bit;
+                    newVel[bit] = 100;
+                }
+
+                // From-silence onset grace: suppresses stale ring detections
+                // when no notes are active. Mid-note transitions use cancel grace.
+                if (wasOnset && r.swiftOnsetGrace <= 0) {
+                    r.swiftOnsetGrace = 2;
+                    r.swiftGraceStaleNote = -1;
+                }
+                if (r.swiftOnsetGrace > 0) {
+                    if (!r.activeNotes && newBits) {
+                        const int detected = NOTE_BASE + __builtin_ctzll(newBits);
+                        const int tp = r.transitionProv.load(std::memory_order_acquire);
+                        // Don't suppress if consensus confirms (SwiftF0 == transitionProv)
+                        if (detected != tp) {
+                            if (r.swiftGraceStaleNote < 0) {
+                                r.swiftGraceStaleNote = detected;
+                                newBits = 0;
+                                effectiveNote = -1;
+                            } else if (detected == r.swiftGraceStaleNote) {
+                                newBits = 0;
+                                effectiveNote = -1;
+                            }
+                        }
+                    }
+                    --r.swiftOnsetGrace;
+                }
+
+                // Decay-tail ghost suppression: if SwiftF0 wants to create a
+                // new note-ON but no onset fired recently, this is likely a
+                // harmonic from a decaying string.  In mono/swiftmono every
+                // legitimate new note starts with an onset.
+                if (newBits & ~r.activeNotes) {
+                    const uint64_t elapsed =
+                        m->totalSamples.load(std::memory_order_relaxed)
+                        - m->lastOnsetSample.load(std::memory_order_acquire);
+                    constexpr double ONSET_GATE_S = 0.25;
+                    const auto gate = static_cast<uint64_t>(m->sampleRate * ONSET_GATE_S);
+                    if (elapsed > gate) {
+                        newBits = 0;
+                        effectiveNote = -1;
+                    }
+                }
+
+                // SwiftF0 note-change confirmation: require 2 consecutive cycles
+                // of the same new note before firing. Eliminates 1-cycle
+                // transitional half-steps (e.g. D#4 between E4→D4).
+                {
+                    const uint64_t playing = r.activeNotes | r.holdNotes;
+                    if (newBits && playing && newBits != r.activeNotes) {
+                        const int detected = NOTE_BASE + __builtin_ctzll(newBits);
+                        const int tp = r.transitionProv.load(std::memory_order_acquire);
+                        if (detected == tp) {
+                            // Consensus: SwiftF0 agrees with OBP/MPM → fire immediately
+                            r.transitionProv.store(-1, std::memory_order_release);
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        } else if (detected == r.swiftPendingNote) {
+                            // Second consecutive sighting — confirmed
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        } else if (r.swiftPendingAge < 3) {
+                            // First sighting or different note — suppress
+                            r.swiftPendingNote = detected;
+                            ++r.swiftPendingAge;
+                            newBits = r.activeNotes;
+                            effectiveNote = r.activeNotes
+                                ? NOTE_BASE + __builtin_ctzll(r.activeNotes) : -1;
+                            for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                                newVel[__builtin_ctzll(tmp)] = 100;
+                        } else {
+                            // Pending expired (oscillating too long) — allow through
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        }
+                    } else {
+                        r.swiftPendingNote = -1;
+                        r.swiftPendingAge  = 0;
+                    }
+                }
+
+                // Only print when the detected note changes for this range.
+                if (effectiveNote != r.lastSwiftPrint) {
+                    r.lastSwiftPrint = effectiveNote;
+                    const double elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - m->startTime).count();
+                    if (effectiveNote >= 0) {
+                        std::printf("[+%.3fs]  --   SwiftF0 → %-4s (%3d)"
+                                    "  [inf %4.0fms  range %s]\n",
+                                    elapsed, midiToName(effectiveNote).c_str(),
+                                    effectiveNote, inferMs, r.cfg.name.c_str());
+                    } else {
+                        std::printf("[+%.3fs]  --   SwiftF0 → silent"
+                                    "  [inf %4.0fms  range %s]\n",
+                                    elapsed, inferMs, r.cfg.name.c_str());
+                    }
+                    std::fflush(stdout);
+                }
+            } else {
+                // BasicPitch (CNN) path.
+                const auto t0 = std::chrono::steady_clock::now();
+                r.basicPitch->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
+                r.snapChan.ready.store(false, std::memory_order_release);
+                inferMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                buildNNBits(r, m->ampFloor, newBits, newVel);
+            }
+
+            const uint64_t prevActive = r.activeNotes;
+
+            // Cancel grace: first inference cycle after a new provisional fires often
             // contains mostly the previous note's audio.  Suppress that cancel so
             // the next cycle (with a full window of the new note) decides instead.
-            if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
-                r.provLastSeenByCNN = provForDiff;
-                r.provCancelGrace   = 1;
-            }
-            if (provForDiff != -1 && r.provCancelGrace > 0) {
-                const int bit = provForDiff - NOTE_BASE;
-                if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
-                    --r.provCancelGrace;
-                    newBits    |= (1ULL << bit);  // suppress cancel; note already playing
-                    newVel[bit] = 64;             // velocity unused (no new note-ON fired)
-                } else {
-                    r.provCancelGrace = 0;  // CNN confirmed naturally
+            // Re-enabled for swiftmono: now that the immediate path requires
+            // OBP==MPM agreement, provisionals are accurate and worth protecting.
+            {
+                if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
+                    r.provLastSeenByCNN = provForDiff;
+                    r.provCancelGrace   = 1;
+                }
+                if (provForDiff != -1 && r.provCancelGrace > 0) {
+                    const int bit = provForDiff - NOTE_BASE;
+                    if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
+                        --r.provCancelGrace;
+                        newBits    |= (1ULL << bit);  // suppress cancel; note already playing
+                        newVel[bit] = 127;            // max velocity so prov wins mono reduction
+                    } else {
+                        r.provCancelGrace = 0;  // confirmed naturally
+                    }
                 }
             }
 
-            applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff, mono);
+            if (swiftMono) {
+                // SwiftF0 path: call state machine directly (SwiftF0 log already printed above).
+                applyNotesDiff(r, newBits, newVel, provForDiff, mono,
+                               r.cfg.swiftHoldCycles);
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - m->startTime).count();
+                for (uint64_t tmp = r.activeNotes & ~prevActive; tmp; tmp &= tmp - 1) {
+                    const int bit = __builtin_ctzll(tmp);
+                    const int p   = NOTE_BASE + bit;
+                    std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d"
+                                "  [SwiftF0  win %4.0fms  inf %4.0fms  range %s]\n",
+                                elapsed, midiToName(p).c_str(), p, newVel[bit],
+                                r.cfg.windowMs, inferMs, r.cfg.name.c_str());
+                }
+                for (uint64_t tmp = prevActive & ~r.activeNotes; tmp; tmp &= tmp - 1) {
+                    const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+                    std::printf("[+%.3fs]  OFF  %-4s (%3d)\n",
+                                elapsed, midiToName(p).c_str(), p);
+                }
+                std::fflush(stdout);
+            } else {
+                applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff, mono);
+            }
 
-            // Mono cross-range: new note-ON(s) in this range → kill all other ranges
+            // Mono/SwiftMono cross-range: new note-ON(s) in this range → kill all other ranges
             if (mono && (r.activeNotes & ~prevActive)) {
                 const double elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - m->startTime).count();
@@ -342,12 +517,53 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         if (pp == -1) continue;
         rp.provMidiPitch = -1;
 
-        // Check if a lower range already fired something this onset that makes this one
-        // a harmonic (diff 12 or 24) or an adjacent-frequency artefact (diff ≤ 1).
+        // Same note already active: re-hit (release+restart) if PICK fired this
+        // callback (genuine re-pick), else skip (RMS re-trigger artifact).
+        if (pp >= NOTE_BASE && pp < NOTE_BASE + NOTE_COUNT) {
+            const uint64_t bits = rp.activeNotesBits.load(std::memory_order_acquire);
+            if (bits & (1ULL << (pp - NOTE_BASE))) {
+                if (m->pickFiredRemain <= 0) continue;
+                // PICK-triggered re-hit: release existing voice for clean retrigger
+                for (auto& v : m->voices)
+                    if (v.pitch == pp && v.state != 0 && v.state != 3)
+                        v.state = 3;
+            } else if (bits != 0) {
+                // Transition: defer MIDI ON, store for SwiftF0 consensus.
+                // Clear provNote so worker doesn't silently insert the note
+                // into activeNotes without a MIDI ON.
+                rp.transitionProv.store(pp, std::memory_order_release);
+                rp.provNote.store(-1, std::memory_order_release);
+                rp.provCooldownRemain = static_cast<int>(m->sampleRate * 0.2);
+                rp.provCooldownNote   = pp;
+                continue;
+            }
+        }
+
+        // Skip if same note under cooldown (RMS re-trigger suppression)
+        if (rp.provCooldownRemain > 0 && pp == rp.provCooldownNote) continue;
+
+        // High-note harmonic suppression: when a note >= E5 is active in
+        // another range, this provisional is likely a sympathetic harmonic.
+        if (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO) {
+            constexpr uint64_t highMask = ~((1ULL << (76 - NOTE_BASE)) - 1);
+            bool highActive = false;
+            for (const auto& other : m->ranges) {
+                if (other.get() == &rp) continue;
+                if (other->activeNotesBits.load(std::memory_order_acquire) & highMask)
+                    { highActive = true; break; }
+            }
+            if (highActive) continue;
+        }
+
+        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
+
+        // Mono: suppress if ANY other range already fired a provisional this onset.
+        // Poly: suppress harmonics (diff 12/24) and adjacent artefacts (diff ≤ 5).
         bool suppressed = false;
         for (int j = 0; j < ri && !suppressed; ++j) {
             const int pj = m->onsetProvNotes[j];
             if (pj == -1) continue;
+            if (mono) { suppressed = true; break; }
             const int diff = pp - pj;
             if (diff == 12 || diff == 24 || std::abs(diff) <= 5)
                 suppressed = true;
@@ -377,8 +593,8 @@ static void processSynth(Monitor* m, float* out, int nFrames)
 
         rp.provOnTimeMs = elapsed * 1000.0;  // ms since startTime
 
-        // Mono: release all currently playing voices before firing new note
-        if (m->mode == PlayMode::MONO) {
+        // Mono/SwiftMono: release all currently playing voices before firing new note
+        if (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO) {
             for (auto& v : m->voices)
                 if (v.state != 0 && v.state != 3)
                     v.state = 3;  // enter release
@@ -401,6 +617,8 @@ static void processSynth(Monitor* m, float* out, int nFrames)
             if (l < bestLevel) { bestLevel = l; best = i; }
         }
         m->voices[best] = { pp, midiToFreq(pp), 0.0, 100.0f / 127.0f, 1, 0.0f };
+        rp.provCooldownRemain = static_cast<int>(m->sampleRate * 0.2);
+        rp.provCooldownNote   = pp;
     }
 
     // Drain all ranges' MIDI output queues — lockless
@@ -408,6 +626,11 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         PendingNote pn;
         while (rp->midiOut.pop(pn)) {
             if (pn.noteOn) {
+                std::printf("[+%.3fs]  >>   %-4s (%3d)  vel %3d"
+                            "  [synth ON   range %s]\n",
+                            elapsed, midiToName(pn.pitch).c_str(),
+                            pn.pitch, pn.velocity, rp->cfg.name.c_str());
+                std::fflush(stdout);
                 int   best      = 0;
                 float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
                 for (int i = 0; i < MAX_VOICES; ++i) {
@@ -417,6 +640,11 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                 }
                 m->voices[best] = { pn.pitch, midiToFreq(pn.pitch), 0.0, pn.velocity / 127.0f, 1, 0.0f };
             } else {
+                std::printf("[+%.3fs]  >>   %-4s (%3d)          "
+                            "  [synth OFF  range %s]\n",
+                            elapsed, midiToName(pn.pitch).c_str(),
+                            pn.pitch, rp->cfg.name.c_str());
+                std::fflush(stdout);
                 for (int i = 0; i < MAX_VOICES; ++i)
                     if (m->voices[i].pitch == pn.pitch && m->voices[i].state != 0)
                         m->voices[i].state = 3;
@@ -459,16 +687,64 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     const float blockRms = std::sqrt(sumSq / static_cast<float>(nFrames));
     const bool  gated    = (blockRms < m->gateFloor);
 
-    // Onset detection: force-dispatch all ready rings when a pick attack is detected.
+    // Onset detection: HPF pick detector is primary, RMS is fallback.
+    m->totalSamples.fetch_add(nFrames, std::memory_order_relaxed);
     bool onsetFired = false;
-    if (m->onsetBlankRemain > 0) {
-        m->onsetBlankRemain -= static_cast<int>(nFrames);
-        if (m->onsetBlankRemain < 0) m->onsetBlankRemain = 0;
-    } else if (!gated && blockRms > m->onsetSmoothedRms * ONSET_RATIO) {
-        onsetFired            = true;
-        m->onsetBlankRemain   = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
-        m->onsetSmoothedRms   = blockRms;
-        m->onsetProvNotes.fill(-1);  // new onset: reset cross-range provisional tracking
+    if (m->pickFiredRemain > 0)
+        m->pickFiredRemain -= static_cast<int>(nFrames);
+
+    // Primary: HPF pick detector with two-tier confirmation.
+    //   Tier 1 (ratio ≥ 10): high confidence — immediate onset.
+    //   Tier 2 (ratio 4–10): tentative — confirmed only if RMS also agrees.
+    constexpr float PICK_HIGH_TIER = 10.0f;
+    int  pickSample   = -1;
+    float pickRatioVal = 0.0f;
+    if (!gated)
+        pickSample = m->pickDetector.process(in, static_cast<int>(nFrames), pickRatioVal);
+
+    const bool rmsWouldFire = !gated && m->onsetBlankRemain <= 0
+                              && blockRms > m->onsetSmoothedRms * ONSET_RATIO;
+
+    if (pickSample >= 0 && (pickRatioVal >= PICK_HIGH_TIER || rmsWouldFire)) {
+        onsetFired          = true;
+        // Any PICK: reset provisional cooldowns (genuine new attack).
+        for (auto& rp2 : m->ranges)
+            { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
+        m->pickFiredRemain = static_cast<int>(m->sampleRate * 0.05);  // 50ms window
+        m->onsetBlankRemain = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
+        m->onsetSmoothedRms = blockRms;
+        m->lastOnsetSample.store(
+            m->totalSamples.load(std::memory_order_relaxed)
+                - static_cast<uint64_t>(nFrames) + static_cast<uint64_t>(pickSample),
+            std::memory_order_release);
+        m->onsetProvNotes.fill(-1);
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m->startTime).count();
+        const double offsetMs = pickSample / m->sampleRate * 1000.0;
+        std::printf("[+%.3fs]  --   PICK onset  (sample %d/%u  +%.1fms  ratio %.1f%s)\n",
+                    elapsed, pickSample, nFrames, offsetMs, pickRatioVal,
+                    pickRatioVal < PICK_HIGH_TIER ? "  +RMS" : "");
+        std::fflush(stdout);
+    }
+
+    // Fallback: RMS onset (hammer-ons, volume swells, etc.)
+    if (!onsetFired) {
+        if (m->onsetBlankRemain > 0) {
+            m->onsetBlankRemain -= static_cast<int>(nFrames);
+            if (m->onsetBlankRemain < 0) m->onsetBlankRemain = 0;
+        } else if (rmsWouldFire) {
+            onsetFired            = true;
+            m->onsetBlankRemain   = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
+            m->onsetSmoothedRms   = blockRms;
+            m->lastOnsetSample.store(m->totalSamples.load(std::memory_order_relaxed),
+                                     std::memory_order_release);
+            m->onsetProvNotes.fill(-1);
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - m->startTime).count();
+            std::printf("[+%.3fs]  --   RMS onset  (rms %.4f / bg %.4f)\n",
+                        elapsed, blockRms, m->onsetSmoothedRms / ONSET_RATIO);
+            std::fflush(stdout);
+        }
     }
     if (!onsetFired && m->onsetBlankRemain == 0)
         m->onsetSmoothedRms = m->onsetSmoothedRms * (1.0f - ONSET_ALPHA) + blockRms * ONSET_ALPHA;
@@ -488,6 +764,10 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         armOrExpireOBP(r, static_cast<float>(m->sampleRate),
                        static_cast<int>(nFrames), onsetFired);
 
+        // Decrement provisional cooldown
+        if (r.provCooldownRemain > 0)
+            r.provCooldownRemain -= static_cast<int>(nFrames);
+
         // Push to MPM while OBP window is active OR while awaiting MPM on a pending vote.
         if (!gated && (r.obdOnsetActive || r.obdPendingNote != -1))
             r.mpm.push(in, static_cast<int>(nFrames));
@@ -499,11 +779,46 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                                 static_cast<float>(m->sampleRate),
                                                 m->ranges);
                 if (finalNote == -1 && !r.obdOnsetActive) {
+                    // OBP expired — try MPM alone as fallback
+                    const float  sr      = static_cast<float>(m->sampleRate);
+                    const int    mpmNote = r.mpm.analyze(sr, r.cfg.midiLow, r.cfg.midiHigh);
+                    const int    mpmFill = r.mpm.circFill;
                     const double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - m->startTime).count();
-                    std::printf("[+%.3fs]  --   OBP window expired  no vote  [range %s]\n",
-                                elapsed, r.cfg.name.c_str());
-                    std::fflush(stdout);
+                    if (mpmNote != -1) {
+                        // Mono: suppress if another range already has a provisional
+                        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
+                        bool suppress = false;
+                        if (mono) {
+                            for (const auto& orp : m->ranges) {
+                                if (orp.get() == &r) continue;
+                                if (orp->activeNotesBits.load(std::memory_order_acquire) != 0
+                                    || orp->provNote.load(std::memory_order_relaxed) != -1)
+                                    { suppress = true; break; }
+                            }
+                        }
+                        if (!suppress) {
+                            std::printf("[+%.3fs]  --   MPM fallback (fill %d): %-4s(%d)"
+                                        "  prov fired  [range %s]\n",
+                                        elapsed, mpmFill,
+                                        midiToName(mpmNote).c_str(), mpmNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                            r.provMidiPitch = mpmNote;
+                            r.provNote.store(mpmNote, std::memory_order_release);
+                            r.monoHeldNote.store(mpmNote, std::memory_order_release);
+                        } else {
+                            std::printf("[+%.3fs]  --   OBP expired  MPM→%-4s(%d)"
+                                        "  suppressed (mono)  [range %s]\n",
+                                        elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                        }
+                    } else {
+                        std::printf("[+%.3fs]  --   OBP window expired  no vote  [range %s]\n",
+                                    elapsed, r.cfg.name.c_str());
+                        std::fflush(stdout);
+                    }
                 }
                 if (finalNote != -1) {
                     const float  sr      = static_cast<float>(m->sampleRate);
@@ -521,15 +836,8 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                     midiToName(finalNote).c_str(), finalNote,
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
-                    } else if (mpmNote != finalNote) {
-                        std::printf("[+%.3fs]  --   MPM disagrees (fill %d):"
-                                    "  OBP→%-4s(%d)  MPM→%-4s(%d)  suppressed  [range %s]\n",
-                                    elapsed, mpmFill,
-                                    midiToName(finalNote).c_str(), finalNote,
-                                    midiToName(mpmNote).c_str(), mpmNote,
-                                    r.cfg.name.c_str());
-                        std::fflush(stdout);
-                    } else {
+                    } else if (mpmNote == finalNote) {
+                        // OBP + MPM agree — fire immediately
                         std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
                                     "  prov fired  [range %s]\n",
                                     elapsed, mpmFill,
@@ -539,6 +847,17 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                         r.provMidiPitch = finalNote;
                         r.provNote.store(finalNote, std::memory_order_release);
                         r.monoHeldNote.store(finalNote, std::memory_order_release);
+                    } else {
+                        // OBP + MPM disagree — save pending; retry with more data
+                        r.obdPendingNote   = finalNote;
+                        r.obdPendingRemain = static_cast<int>(m->sampleRate * 0.1f);
+                        std::printf("[+%.3fs]  --   MPM disagrees (fill %d):"
+                                    "  OBP→%-4s(%d)  MPM→%-4s(%d)  pending  [range %s]\n",
+                                    elapsed, mpmFill,
+                                    midiToName(finalNote).c_str(), finalNote,
+                                    midiToName(mpmNote).c_str(), mpmNote,
+                                    r.cfg.name.c_str());
+                        std::fflush(stdout);
                     }
                 }
             }
@@ -564,22 +883,44 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                     const double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - m->startTime).count();
                     r.obdPendingNote = -1;
-                    if (mpmNote == pending) {
-                        std::printf("[+%.3fs]  --   MPM confirmed pending OBP→%-4s(%d)"
-                                    "  (fill %d)  prov fired  [range %s]\n",
-                                    elapsed, midiToName(pending).c_str(), pending,
-                                    mpmFill, r.cfg.name.c_str());
+                    // Mono: suppress if any other range has a provisional.
+                    // Poly: suppress harmonics (±12/24).
+                    const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
+                    bool mpmHarmonic = false;
+                    for (const auto& orp : m->ranges) {
+                        if (orp.get() == &r) continue;
+                        if (mono && (orp->activeNotesBits.load(std::memory_order_acquire) != 0
+                                     || orp->provNote.load(std::memory_order_relaxed) != -1))
+                            { mpmHarmonic = true; break; }
+                        const int op2 = orp->provNote.load(std::memory_order_relaxed);
+                        if (op2 != -1) {
+                            const int ad = std::abs(mpmNote - op2);
+                            if (ad == 12 || ad == 24) { mpmHarmonic = true; break; }
+                        }
+                    }
+                    if (mpmHarmonic) {
+                        std::printf("[+%.3fs]  --   MPM→%-4s(%d) suppressed (mono/harmonic)"
+                                    "  [range %s]\n",
+                                    elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                    r.cfg.name.c_str());
                         std::fflush(stdout);
-                        r.provMidiPitch = pending;
-                        r.provNote.store(pending, std::memory_order_release);
-                        r.monoHeldNote.store(pending, std::memory_order_release);
                     } else {
-                        std::printf("[+%.3fs]  --   MPM suppressed pending OBP→%-4s(%d)"
-                                    "  MPM→%-4s(%d)  (fill %d)  [range %s]\n",
-                                    elapsed, midiToName(pending).c_str(), pending,
-                                    midiToName(mpmNote).c_str(), mpmNote,
-                                    mpmFill, r.cfg.name.c_str());
+                        if (mpmNote != pending) {
+                            std::printf("[+%.3fs]  --   MPM corrects pending OBP→%-4s(%d)"
+                                        "  MPM→%-4s(%d)  (fill %d)  prov fired  [range %s]\n",
+                                        elapsed, midiToName(pending).c_str(), pending,
+                                        midiToName(mpmNote).c_str(), mpmNote,
+                                        mpmFill, r.cfg.name.c_str());
+                        } else {
+                            std::printf("[+%.3fs]  --   MPM confirmed pending OBP→%-4s(%d)"
+                                        "  (fill %d)  prov fired  [range %s]\n",
+                                        elapsed, midiToName(pending).c_str(), pending,
+                                        mpmFill, r.cfg.name.c_str());
+                        }
                         std::fflush(stdout);
+                        r.provMidiPitch = mpmNote;
+                        r.provNote.store(mpmNote, std::memory_order_release);
+                        r.monoHeldNote.store(mpmNote, std::memory_order_release);
                     }
                 }
                 // mpmNote == -1: still not ready, try again next callback
@@ -601,15 +942,16 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 int main(int argc, char** argv)
 {
     std::string bundlePath, configPath;
-    float    threshold      = -1.0f;  // -1 = not set on CLI, use conf/default
-    float    frameThreshold = -1.0f;
-    float    gateFloor      = -1.0f;
-    float    ampFloor       = -1.0f;
-    float    onsetBlankMs   = -1.0f;
-    int      holdCyclesLow  = 2;
-    float    windowMs       = 150.0f;
-    PlayMode mode           = PlayMode::POLY;
-    bool     modeSet        = false;
+    float    threshold       = -1.0f;  // -1 = not set on CLI, use conf/default
+    float    frameThreshold  = -1.0f;
+    float    gateFloor       = -1.0f;
+    float    ampFloor        = -1.0f;
+    float    onsetBlankMs    = -1.0f;
+    float    swiftThreshold  = -1.0f;
+    int      holdCyclesLow   = 2;
+    float    windowMs        = 150.0f;
+    PlayMode mode            = PlayMode::POLY;
+    bool     modeSet         = false;
     Waveform waveform       = Waveform::SINE;
     float    attackMs       = 10.0f;
     float    releaseMs      = 400.0f;
@@ -623,11 +965,14 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--hold-cycles")     && i+1 < argc) holdCyclesLow  = std::stoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--gate")            && i+1 < argc) gateFloor      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--amp-floor")       && i+1 < argc) ampFloor       = std::stof(argv[++i]);
-        else if (!std::strcmp(argv[i], "--onset-blank")     && i+1 < argc) onsetBlankMs   = std::stof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--onset-blank")     && i+1 < argc) onsetBlankMs  = std::stof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--swift-threshold") && i+1 < argc) swiftThreshold = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--window")          && i+1 < argc) windowMs       = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--mode")            && i+1 < argc) {
             const char* s = argv[++i];
-            mode    = (!std::strcmp(s, "mono")) ? PlayMode::MONO : PlayMode::POLY;
+            if      (!std::strcmp(s, "mono"))      mode = PlayMode::MONO;
+            else if (!std::strcmp(s, "swiftmono")) mode = PlayMode::SWIFT_MONO;
+            else                                   mode = PlayMode::POLY;
             modeSet = true;
         }
         else if (!std::strcmp(argv[i], "--attack")          && i+1 < argc) attackMs       = std::stof(argv[++i]);
@@ -641,9 +986,9 @@ int main(int argc, char** argv)
         } else {
             std::fprintf(stderr,
                 "Usage: %s [--bundle PATH] [--config PATH]\n"
-                "          [--threshold F] [--frame-threshold F] [--mode mono|poly]\n"
-                "          [--hold-cycles N] [--gate F] [--amp-floor F] [--window MS]\n"
-                "          [--onset-blank MS]\n"
+                "          [--threshold F] [--frame-threshold F] [--mode mono|poly|swiftmono]\n"
+                "          [--swift-threshold F] [--hold-cycles N] [--gate F] [--amp-floor F]\n"
+                "          [--window MS] [--onset-blank MS]\n"
                 "          [--waveform sine|saw|square] [--attack MS] [--release MS] [--volume F]\n",
                 argv[0]);
             return 1;
@@ -694,6 +1039,7 @@ int main(int argc, char** argv)
     if (threshold      >= 0.0f)  rangeCfg.threshold       = threshold;
     if (frameThreshold >= 0.0f)  rangeCfg.frameThreshold  = frameThreshold;
     if (onsetBlankMs   >= 0.0f)  rangeCfg.onsetBlankMs    = onsetBlankMs;
+    if (swiftThreshold >= 0.0f)  rangeCfg.swiftF0Threshold = swiftThreshold;
     if (modeSet)                 rangeCfg.mode             = mode;
 
     if (rangeCfg.ranges.empty()) {
@@ -714,17 +1060,22 @@ int main(int argc, char** argv)
     std::printf("AmpFloor:   %.2f\n", rangeCfg.ampFloor);
     std::printf("Threshold:  %.3f\n", rangeCfg.threshold);
     std::printf("FrameThr:   %.3f\n", rangeCfg.frameThreshold);
-    std::printf("Mode:       %s\n", rangeCfg.mode == PlayMode::MONO ? "mono" : "poly");
+    std::printf("Mode:       %s\n",
+                rangeCfg.mode == PlayMode::MONO       ? "mono" :
+                rangeCfg.mode == PlayMode::SWIFT_MONO ? "swiftmono" : "poly");
+    if (rangeCfg.mode == PlayMode::SWIFT_MONO)
+        std::printf("SwiftThr:   %.2f\n", rangeCfg.swiftF0Threshold);
     std::printf("OnsetBlank: %.0f ms\n", rangeCfg.onsetBlankMs);
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
                 MIN_FRESH_FLOOR / static_cast<float>(PLUGIN_SR) * 1000.0f);
     std::printf("\nNote ranges (%zu, single worker thread):\n", rangeCfg.ranges.size());
-    std::printf("  %-12s  %4s  %4s  %6s  %3s  %s\n",
-                "Name","Low","High","WinMs","MNL","Hold");
+    std::printf("  %-12s  %4s  %4s  %6s  %3s  %4s  %s\n",
+                "Name","Low","High","WinMs","MNL","Hold","SfHd");
     for (const auto& r : rangeCfg.ranges)
-        std::printf("  %-12s  %4d  %4d  %6.0f  %3d  %d\n",
+        std::printf("  %-12s  %4d  %4d  %6.0f  %3d  %4d  %d\n",
                     r.name.c_str(), r.midiLow, r.midiHigh,
-                    r.windowMs, r.minNoteLength, r.holdCycles);
+                    r.windowMs, r.minNoteLength, r.holdCycles,
+                    r.swiftHoldCycles);
     const char* wfName = waveform == Waveform::SAW ? "saw" : waveform == Waveform::SQUARE ? "square" : "sine";
     std::printf("\nWaveform:   %s  Attack: %.0f ms  Release: %.0f ms  Volume: %.2f\n\n",
                 wfName, attackMs, releaseMs, masterVol);
@@ -733,12 +1084,39 @@ int main(int argc, char** argv)
     catch (const std::exception& e) { std::fprintf(stderr, "Failed to load models: %s\n", e.what()); return 1; }
 
     Monitor mon;
-    mon.gateFloor      = rangeCfg.gateFloor;
-    mon.ampFloor       = rangeCfg.ampFloor;
-    mon.threshold      = rangeCfg.threshold;
-    mon.frameThreshold = rangeCfg.frameThreshold;
-    mon.onsetBlankMs   = rangeCfg.onsetBlankMs;
-    mon.mode           = rangeCfg.mode;
+    mon.gateFloor       = rangeCfg.gateFloor;
+    mon.ampFloor        = rangeCfg.ampFloor;
+    mon.threshold       = rangeCfg.threshold;
+    mon.frameThreshold  = rangeCfg.frameThreshold;
+    mon.onsetBlankMs    = rangeCfg.onsetBlankMs;
+    mon.swiftF0Threshold = rangeCfg.swiftF0Threshold;
+    mon.mode            = rangeCfg.mode;
+
+    // Try to load SwiftF0 model
+    {
+        std::string sf0Path;
+        // Try next to binary first, then bundle path
+        const std::string probes[] = {
+            selfDir + "swift_f0_model.onnx",
+            bundlePath + (bundlePath.empty() || bundlePath.back() == '/' ? "" : "/") + "swift_f0_model.onnx"
+        };
+        for (const auto& p : probes) {
+            FILE* f = std::fopen(p.c_str(), "rb");
+            if (f) { std::fclose(f); sf0Path = p; break; }
+        }
+        if (!sf0Path.empty()) {
+            try {
+                mon.swiftF0 = std::make_unique<SwiftF0Detector>(sf0Path);
+                std::printf("SwiftF0:    loaded from %s\n", sf0Path.c_str());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "Warning: SwiftF0 model load failed (%s) — "
+                             "swiftmono will fall back to BasicPitch\n", e.what());
+            }
+        } else if (rangeCfg.mode == PlayMode::SWIFT_MONO) {
+            std::fprintf(stderr, "Warning: swift_f0_model.onnx not found — "
+                         "swiftmono will fall back to BasicPitch\n");
+        }
+    }
     mon.waveform  = waveform;
     mon.attackMs  = attackMs;
     mon.releaseMs = releaseMs;
@@ -764,10 +1142,13 @@ int main(int argc, char** argv)
     mon.sampleRate = jack_get_sample_rate(client);
     std::printf("JACK:       %.0f Hz, buffer %u frames\n", mon.sampleRate, jack_get_buffer_size(client));
 
+    // Configure HPF pick detector.
+    mon.pickDetector.init(static_cast<float>(mon.sampleRate));
+
     // Configure per-range OBP lowpass and MPM (both need sample rate).
     for (auto& rp : mon.ranges) {
         const float sr     = static_cast<float>(mon.sampleRate);
-        const float cutoff = std::min(midiToFreq(rp->cfg.midiHigh) * 1.5f, sr * 0.45f);
+        const float cutoff = std::min(midiToFreq(rp->cfg.midiHigh) * 1.2f, sr * 0.45f);
         rp->obd.setLowpass(cutoff, sr);
         rp->mpm.init(sr, rp->cfg.midiLow, rp->cfg.midiHigh);
     }

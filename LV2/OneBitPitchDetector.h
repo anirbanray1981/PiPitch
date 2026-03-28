@@ -112,6 +112,7 @@ struct OneBitPitchDetector {
         z1s1 = z2s1 = z1s2 = z2s2 = 0.0f;
     }
 
+    // Full reset (filter + detection).  Use only when sample rate changes.
     void reset()
     {
         counter     = 0;
@@ -120,6 +121,19 @@ struct OneBitPitchDetector {
         schmittHigh = false;
         filtAmpEMA  = 0.001f;
         z1s1 = z2s1 = z1s2 = z2s2 = 0.0f;
+        std::fill(buf, buf + N_AVG, 0);
+    }
+
+    // Detection-only reset: preserves filter state so there is no transient
+    // when a new onset hits the filter with a sudden step input.
+    void resetDetection()
+    {
+        counter     = 0;
+        writeIdx    = 0;
+        validCount  = 0;
+        schmittHigh = false;
+        // filtAmpEMA preserved — keeps threshold calibrated to current signal level
+        // filter z-states preserved — avoids transient oscillation on pick attack
         std::fill(buf, buf + N_AVG, 0);
     }
 
