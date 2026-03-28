@@ -16,7 +16,7 @@
  *
  * Usage:
  *   neuralnote_tune [--bundle PATH] [--config PATH]
- *                   [--threshold 0.6] [--frame-threshold 0.5] [--mode poly|mono]
+ *                   [--threshold 0.6] [--frame-threshold 0.5] [--mode poly|mono|swiftmono|swiftpoly]
  *                   [--hold-cycles 2] [--gate 0.003] [--amp-floor 0.65] [--window 150]
  *                   [--waveform sine|saw|square]
  *                   [--attack MS] [--release MS] [--volume 0.3]
@@ -238,6 +238,7 @@ static void runWorker(Monitor* m)
         if (m->workerQuit.load(std::memory_order_acquire)) break;
 
         const bool swiftMono = (m->mode == PlayMode::SWIFT_MONO && m->swiftF0 != nullptr);
+        const bool swiftPoly = (m->mode == PlayMode::SWIFT_POLY && m->swiftF0 != nullptr);
         const bool mono      = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
 
         for (int ri = 0; ri < static_cast<int>(m->ranges.size()); ++ri) {
@@ -403,6 +404,160 @@ static void runWorker(Monitor* m)
                     }
                     std::fflush(stdout);
                 }
+            } else if (swiftPoly) {
+                // SwiftPoly path: run SwiftF0 AND BasicPitch, merge results.
+                // Step 1: resample 22050→16000 for SwiftF0.
+                const float* src    = r.snapChan.data.data();
+                const int    srcLen = r.snapChan.snapshotSize;
+                const bool   wasOnset = r.snapChan.onsetDispatched;
+                constexpr double SF0_SR = 16000.0;
+                const double ratio  = SF0_SR / PLUGIN_SR;
+                const int    dstLen = static_cast<int>(srcLen * ratio);
+                m->sf0Buf.resize(dstLen);
+                for (int i = 0; i < dstLen; ++i) {
+                    const double pos = i / ratio;
+                    const int    s0  = static_cast<int>(pos);
+                    const double f   = pos - s0;
+                    const int    s1  = std::min(s0 + 1, srcLen - 1);
+                    m->sf0Buf[i]     = static_cast<float>((1.0 - f) * src[s0] + f * src[s1]);
+                }
+
+                // Step 2: SwiftF0 inference.
+                const auto t0 = std::chrono::steady_clock::now();
+                const int swiftNote = m->swiftF0->infer(
+                    m->sf0Buf.data(), dstLen, m->swiftF0Threshold);
+                const double sf0Ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+
+                // Step 3: BasicPitch inference (reads same snapshot data).
+                const auto t1 = std::chrono::steady_clock::now();
+                r.basicPitch->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
+                r.snapChan.ready.store(false, std::memory_order_release);
+                const double cnnMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t1).count();
+                inferMs = sf0Ms + cnnMs;
+
+                uint64_t cnnBits = 0;
+                int8_t   cnnVel[NOTE_COUNT] = {};
+                buildNNBits(r, m->ampFloor, cnnBits, cnnVel);
+
+                // Step 4: SwiftF0 grace/suppression (same as swiftmono).
+                uint64_t swiftBits = 0;
+                int      effectiveNote = -1;
+                if (swiftNote >= r.cfg.midiLow && swiftNote <= r.cfg.midiHigh &&
+                    swiftNote >= NOTE_BASE && swiftNote < NOTE_BASE + NOTE_COUNT) {
+                    effectiveNote = swiftNote;
+                    swiftBits = 1ULL << (swiftNote - NOTE_BASE);
+                }
+
+                // From-silence onset grace
+                if (wasOnset && r.swiftOnsetGrace <= 0) {
+                    r.swiftOnsetGrace = 2;
+                    r.swiftGraceStaleNote = -1;
+                }
+                if (r.swiftOnsetGrace > 0) {
+                    if (!r.activeNotes && swiftBits) {
+                        const int detected = NOTE_BASE + __builtin_ctzll(swiftBits);
+                        const int tp = r.transitionProv.load(std::memory_order_acquire);
+                        if (detected != tp) {
+                            if (r.swiftGraceStaleNote < 0) {
+                                r.swiftGraceStaleNote = detected;
+                                swiftBits = 0;
+                                effectiveNote = -1;
+                            } else if (detected == r.swiftGraceStaleNote) {
+                                swiftBits = 0;
+                                effectiveNote = -1;
+                            }
+                        }
+                    }
+                    --r.swiftOnsetGrace;
+                }
+
+                // Decay-tail ghost suppression
+                if (swiftBits & ~r.activeNotes) {
+                    const uint64_t elapsedSamples =
+                        m->totalSamples.load(std::memory_order_relaxed)
+                        - m->lastOnsetSample.load(std::memory_order_acquire);
+                    constexpr double ONSET_GATE_S = 0.25;
+                    const auto gate = static_cast<uint64_t>(m->sampleRate * ONSET_GATE_S);
+                    if (elapsedSamples > gate) {
+                        swiftBits = 0;
+                        effectiveNote = -1;
+                    }
+                }
+
+                // Note-change confirmation / consensus
+                {
+                    const uint64_t playing = r.activeNotes | r.holdNotes;
+                    if (swiftBits && playing && swiftBits != r.activeNotes) {
+                        const int detected = NOTE_BASE + __builtin_ctzll(swiftBits);
+                        const int tp = r.transitionProv.load(std::memory_order_acquire);
+                        if (detected == tp) {
+                            r.transitionProv.store(-1, std::memory_order_release);
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        } else if (detected == r.swiftPendingNote) {
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        } else if (r.swiftPendingAge < 3) {
+                            r.swiftPendingNote = detected;
+                            ++r.swiftPendingAge;
+                            swiftBits = 0;
+                            effectiveNote = -1;
+                        } else {
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        }
+                    } else {
+                        r.swiftPendingNote = -1;
+                        r.swiftPendingAge  = 0;
+                    }
+                }
+
+                // Step 5: Merge — SwiftF0 keep-alive + BasicPitch base.
+                // New SwiftF0 notes get added to keep-alive with age SWIFT_POLY_KEEPALIVE.
+                for (uint64_t tmp = swiftBits; tmp; tmp &= tmp - 1) {
+                    const int bit = __builtin_ctzll(tmp);
+                    r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
+                }
+                r.swiftPolyKeepBits |= swiftBits;
+
+                // Age out keep-alive notes not refreshed by SwiftF0 this cycle.
+                for (int b = 0; b < NOTE_COUNT; ++b) {
+                    if (!(swiftBits & (1ULL << b)) && r.swiftPolyKeepAge[b] > 0)
+                        --r.swiftPolyKeepAge[b];
+                    if (r.swiftPolyKeepAge[b] <= 0)
+                        r.swiftPolyKeepBits &= ~(1ULL << b);
+                }
+
+                // Notes confirmed by BasicPitch leave keep-alive.
+                r.swiftPolyKeepBits &= ~cnnBits;
+                for (uint64_t tmp = cnnBits; tmp; tmp &= tmp - 1)
+                    r.swiftPolyKeepAge[__builtin_ctzll(tmp)] = 0;
+
+                // Merged bitmap: BasicPitch base + keep-alive injection.
+                newBits = cnnBits | r.swiftPolyKeepBits;
+                std::memcpy(newVel, cnnVel, NOTE_COUNT);
+                for (uint64_t tmp = r.swiftPolyKeepBits & ~cnnBits; tmp; tmp &= tmp - 1)
+                    newVel[__builtin_ctzll(tmp)] = 100;
+
+                // SwiftF0 log dedup
+                if (effectiveNote != r.lastSwiftPrint) {
+                    r.lastSwiftPrint = effectiveNote;
+                    const double elNow = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - m->startTime).count();
+                    if (effectiveNote >= 0) {
+                        std::printf("[+%.3fs]  --   SwiftF0 → %-4s (%3d)"
+                                    "  [inf %4.0fms  range %s]\n",
+                                    elNow, midiToName(effectiveNote).c_str(),
+                                    effectiveNote, inferMs, r.cfg.name.c_str());
+                    } else {
+                        std::printf("[+%.3fs]  --   SwiftF0 → silent"
+                                    "  [inf %4.0fms  range %s]\n",
+                                    elNow, inferMs, r.cfg.name.c_str());
+                    }
+                    std::fflush(stdout);
+                }
             } else {
                 // BasicPitch (CNN) path.
                 const auto t0 = std::chrono::steady_clock::now();
@@ -448,6 +603,26 @@ static void runWorker(Monitor* m)
                     const int p   = NOTE_BASE + bit;
                     std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d"
                                 "  [SwiftF0  win %4.0fms  inf %4.0fms  range %s]\n",
+                                elapsed, midiToName(p).c_str(), p, newVel[bit],
+                                r.cfg.windowMs, inferMs, r.cfg.name.c_str());
+                }
+                for (uint64_t tmp = prevActive & ~r.activeNotes; tmp; tmp &= tmp - 1) {
+                    const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+                    std::printf("[+%.3fs]  OFF  %-4s (%3d)\n",
+                                elapsed, midiToName(p).c_str(), p);
+                }
+                std::fflush(stdout);
+            } else if (swiftPoly) {
+                // SwiftPoly: polyphonic — mono=false
+                applyNotesDiff(r, newBits, newVel, provForDiff, false,
+                               r.cfg.swiftHoldCycles);
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - m->startTime).count();
+                for (uint64_t tmp = r.activeNotes & ~prevActive; tmp; tmp &= tmp - 1) {
+                    const int bit = __builtin_ctzll(tmp);
+                    const int p   = NOTE_BASE + bit;
+                    std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d"
+                                "  [SwiftPoly  win %4.0fms  inf %4.0fms  range %s]\n",
                                 elapsed, midiToName(p).c_str(), p, newVel[bit],
                                 r.cfg.windowMs, inferMs, r.cfg.name.c_str());
                 }
@@ -544,7 +719,8 @@ static void processSynth(Monitor* m, float* out, int nFrames)
 
         // High-note harmonic suppression: when a note >= E5 is active in
         // another range, this provisional is likely a sympathetic harmonic.
-        if (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO) {
+        if (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO
+            || m->mode == PlayMode::SWIFT_POLY) {
             constexpr uint64_t highMask = ~((1ULL << (76 - NOTE_BASE)) - 1);
             bool highActive = false;
             for (const auto& other : m->ranges) {
@@ -972,6 +1148,7 @@ int main(int argc, char** argv)
             const char* s = argv[++i];
             if      (!std::strcmp(s, "mono"))      mode = PlayMode::MONO;
             else if (!std::strcmp(s, "swiftmono")) mode = PlayMode::SWIFT_MONO;
+            else if (!std::strcmp(s, "swiftpoly")) mode = PlayMode::SWIFT_POLY;
             else                                   mode = PlayMode::POLY;
             modeSet = true;
         }
@@ -986,7 +1163,7 @@ int main(int argc, char** argv)
         } else {
             std::fprintf(stderr,
                 "Usage: %s [--bundle PATH] [--config PATH]\n"
-                "          [--threshold F] [--frame-threshold F] [--mode mono|poly|swiftmono]\n"
+                "          [--threshold F] [--frame-threshold F] [--mode mono|poly|swiftmono|swiftpoly]\n"
                 "          [--swift-threshold F] [--hold-cycles N] [--gate F] [--amp-floor F]\n"
                 "          [--window MS] [--onset-blank MS]\n"
                 "          [--waveform sine|saw|square] [--attack MS] [--release MS] [--volume F]\n",
@@ -1062,8 +1239,9 @@ int main(int argc, char** argv)
     std::printf("FrameThr:   %.3f\n", rangeCfg.frameThreshold);
     std::printf("Mode:       %s\n",
                 rangeCfg.mode == PlayMode::MONO       ? "mono" :
-                rangeCfg.mode == PlayMode::SWIFT_MONO ? "swiftmono" : "poly");
-    if (rangeCfg.mode == PlayMode::SWIFT_MONO)
+                rangeCfg.mode == PlayMode::SWIFT_MONO ? "swiftmono" :
+                rangeCfg.mode == PlayMode::SWIFT_POLY ? "swiftpoly" : "poly");
+    if (rangeCfg.mode == PlayMode::SWIFT_MONO || rangeCfg.mode == PlayMode::SWIFT_POLY)
         std::printf("SwiftThr:   %.2f\n", rangeCfg.swiftF0Threshold);
     std::printf("OnsetBlank: %.0f ms\n", rangeCfg.onsetBlankMs);
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
@@ -1112,9 +1290,9 @@ int main(int argc, char** argv)
                 std::fprintf(stderr, "Warning: SwiftF0 model load failed (%s) — "
                              "swiftmono will fall back to BasicPitch\n", e.what());
             }
-        } else if (rangeCfg.mode == PlayMode::SWIFT_MONO) {
+        } else if (rangeCfg.mode == PlayMode::SWIFT_MONO || rangeCfg.mode == PlayMode::SWIFT_POLY) {
             std::fprintf(stderr, "Warning: swift_f0_model.onnx not found — "
-                         "swiftmono will fall back to BasicPitch\n");
+                         "swift mode will fall back to BasicPitch\n");
         }
     }
     mon.waveform  = waveform;

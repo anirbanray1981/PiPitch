@@ -54,6 +54,7 @@ static constexpr int MIN_FRESH_FLOOR = static_cast<int>(PLUGIN_SR * 0.025); // ~
 
 // ── Onset detection ───────────────────────────────────────────────────────────
 
+static constexpr int   SWIFT_POLY_KEEPALIVE = 2; // cycles to keep SwiftF0 note alive awaiting BasicPitch
 static constexpr float ONSET_RATIO    = 3.0f;   // RMS must exceed background × this
 static constexpr float ONSET_ALPHA    = 0.05f;  // background tracker time constant
 static constexpr float ONSET_BLANK_MS = 25.0f;  // re-trigger suppression window
@@ -250,6 +251,12 @@ struct RangeStateBase {
     // 2 consecutive cycles before firing, eliminating 1-cycle transitional artifacts.
     int                 swiftPendingNote   = -1;   // note awaiting confirmation (-1 = none)
     int                 swiftPendingAge    = 0;    // cycles since pending was set
+
+    // Worker-only: SwiftPoly keep-alive — bridge between SwiftF0 firing a note-ON
+    // and BasicPitch confirming it (~95ms later).  Notes in this bitmap survive in
+    // the merged bitmap even if BasicPitch hasn't seen them yet.
+    uint64_t            swiftPolyKeepBits  = 0;
+    alignas(8) int8_t   swiftPolyKeepAge[NOTE_COUNT] = {};
 
     // Audio→worker: deferred provisional during note transitions.
     // Set by fireProv when a different note is already active (transition mode).
