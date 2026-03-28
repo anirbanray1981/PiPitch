@@ -318,8 +318,8 @@ static void runWorker(Monitor* m)
                     r.swiftGraceStaleNote = -1;
                 }
                 if (r.swiftOnsetGrace > 0) {
-                    if (r.activeNotes && newBits != r.activeNotes) {
-                        // Mid-note transition: keep current note
+                    if (r.activeNotes && newBits && newBits != r.activeNotes) {
+                        // Mid-note transition: wrong note → keep current
                         newBits = r.activeNotes;
                         effectiveNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
                         for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
@@ -327,16 +327,13 @@ static void runWorker(Monitor* m)
                     } else if (!r.activeNotes && newBits) {
                         const int detected = NOTE_BASE + __builtin_ctzll(newBits);
                         if (r.swiftGraceStaleNote < 0) {
-                            // Cycle 1: suppress and remember the stale note
                             r.swiftGraceStaleNote = detected;
                             newBits = 0;
                             effectiveNote = -1;
                         } else if (detected == r.swiftGraceStaleNote) {
-                            // Cycle 2: same stale note → still suppress
                             newBits = 0;
                             effectiveNote = -1;
                         }
-                        // else: different note on cycle 2 → allow (real note)
                     }
                     --r.swiftOnsetGrace;
                 }
@@ -389,9 +386,9 @@ static void runWorker(Monitor* m)
             // Cancel grace: first inference cycle after a new provisional fires often
             // contains mostly the previous note's audio.  Suppress that cancel so
             // the next cycle (with a full window of the new note) decides instead.
-            // Skipped in swiftmono: SwiftF0 is fast enough to correct wrong
-            // provisionals immediately; onset grace handles mixed-audio transitions.
-            if (!swiftMono) {
+            // Re-enabled for swiftmono: now that the immediate path requires
+            // OBP==MPM agreement, provisionals are accurate and worth protecting.
+            {
                 if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
                     r.provLastSeenByCNN = provForDiff;
                     r.provCancelGrace   = 1;
@@ -706,11 +703,46 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                                 static_cast<float>(m->sampleRate),
                                                 m->ranges);
                 if (finalNote == -1 && !r.obdOnsetActive) {
+                    // OBP expired — try MPM alone as fallback
+                    const float  sr      = static_cast<float>(m->sampleRate);
+                    const int    mpmNote = r.mpm.analyze(sr, r.cfg.midiLow, r.cfg.midiHigh);
+                    const int    mpmFill = r.mpm.circFill;
                     const double elapsed = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - m->startTime).count();
-                    std::printf("[+%.3fs]  --   OBP window expired  no vote  [range %s]\n",
-                                elapsed, r.cfg.name.c_str());
-                    std::fflush(stdout);
+                    if (mpmNote != -1) {
+                        // Mono: suppress if another range already has a provisional
+                        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
+                        bool suppress = false;
+                        if (mono) {
+                            for (const auto& orp : m->ranges) {
+                                if (orp.get() == &r) continue;
+                                if (orp->activeNotesBits.load(std::memory_order_acquire) != 0
+                                    || orp->provNote.load(std::memory_order_relaxed) != -1)
+                                    { suppress = true; break; }
+                            }
+                        }
+                        if (!suppress) {
+                            std::printf("[+%.3fs]  --   MPM fallback (fill %d): %-4s(%d)"
+                                        "  prov fired  [range %s]\n",
+                                        elapsed, mpmFill,
+                                        midiToName(mpmNote).c_str(), mpmNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                            r.provMidiPitch = mpmNote;
+                            r.provNote.store(mpmNote, std::memory_order_release);
+                            r.monoHeldNote.store(mpmNote, std::memory_order_release);
+                        } else {
+                            std::printf("[+%.3fs]  --   OBP expired  MPM→%-4s(%d)"
+                                        "  suppressed (mono)  [range %s]\n",
+                                        elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                        }
+                    } else {
+                        std::printf("[+%.3fs]  --   OBP window expired  no vote  [range %s]\n",
+                                    elapsed, r.cfg.name.c_str());
+                        std::fflush(stdout);
+                    }
                 }
                 if (finalNote != -1) {
                     const float  sr      = static_cast<float>(m->sampleRate);
@@ -728,49 +760,28 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                     midiToName(finalNote).c_str(), finalNote,
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
+                    } else if (mpmNote == finalNote) {
+                        // OBP + MPM agree — fire immediately
+                        std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
+                                    "  prov fired  [range %s]\n",
+                                    elapsed, mpmFill,
+                                    midiToName(finalNote).c_str(), finalNote,
+                                    r.cfg.name.c_str());
+                        std::fflush(stdout);
+                        r.provMidiPitch = finalNote;
+                        r.provNote.store(finalNote, std::memory_order_release);
+                        r.monoHeldNote.store(finalNote, std::memory_order_release);
                     } else {
-                        // OBP confirms onset; trust MPM for the pitch.
-                        // Mono: suppress if any other range already has a provisional.
-                        // Poly: suppress harmonics (±12/24 semitones).
-                        const bool mono = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
-                        bool mpmHarmonic = false;
-                        for (const auto& orp : m->ranges) {
-                            if (orp.get() == &r) continue;
-                            const int op2 = orp->provNote.load(std::memory_order_relaxed);
-                            if (op2 != -1) {
-                                if (mono) { mpmHarmonic = true; break; }
-                                const int ad = std::abs(mpmNote - op2);
-                                if (ad == 12 || ad == 24) { mpmHarmonic = true; break; }
-                            }
-                        }
-                        if (mpmHarmonic) {
-                            std::printf("[+%.3fs]  --   MPM→%-4s(%d) suppressed (mono/harmonic)"
-                                        "  [range %s]\n",
-                                        elapsed, midiToName(mpmNote).c_str(), mpmNote,
-                                        r.cfg.name.c_str());
-                            std::fflush(stdout);
-                        } else {
-                            const int provPitch = mpmNote;
-                            if (mpmNote != finalNote) {
-                                std::printf("[+%.3fs]  --   MPM corrects OBP (fill %d):"
-                                            "  OBP→%-4s(%d)  MPM→%-4s(%d)"
-                                            "  prov fired  [range %s]\n",
-                                            elapsed, mpmFill,
-                                            midiToName(finalNote).c_str(), finalNote,
-                                            midiToName(mpmNote).c_str(), mpmNote,
-                                            r.cfg.name.c_str());
-                            } else {
-                                std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
-                                            "  prov fired  [range %s]\n",
-                                            elapsed, mpmFill,
-                                            midiToName(provPitch).c_str(), provPitch,
-                                            r.cfg.name.c_str());
-                            }
-                            std::fflush(stdout);
-                            r.provMidiPitch = provPitch;
-                            r.provNote.store(provPitch, std::memory_order_release);
-                            r.monoHeldNote.store(provPitch, std::memory_order_release);
-                        }
+                        // OBP + MPM disagree — save pending; retry with more data
+                        r.obdPendingNote   = finalNote;
+                        r.obdPendingRemain = static_cast<int>(m->sampleRate * 0.1f);
+                        std::printf("[+%.3fs]  --   MPM disagrees (fill %d):"
+                                    "  OBP→%-4s(%d)  MPM→%-4s(%d)  pending  [range %s]\n",
+                                    elapsed, mpmFill,
+                                    midiToName(finalNote).c_str(), finalNote,
+                                    midiToName(mpmNote).c_str(), mpmNote,
+                                    r.cfg.name.c_str());
+                        std::fflush(stdout);
                     }
                 }
             }
@@ -802,9 +813,11 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                     bool mpmHarmonic = false;
                     for (const auto& orp : m->ranges) {
                         if (orp.get() == &r) continue;
+                        if (mono && (orp->activeNotesBits.load(std::memory_order_acquire) != 0
+                                     || orp->provNote.load(std::memory_order_relaxed) != -1))
+                            { mpmHarmonic = true; break; }
                         const int op2 = orp->provNote.load(std::memory_order_relaxed);
                         if (op2 != -1) {
-                            if (mono) { mpmHarmonic = true; break; }
                             const int ad = std::abs(mpmNote - op2);
                             if (ad == 12 || ad == 24) { mpmHarmonic = true; break; }
                         }

@@ -247,22 +247,19 @@ static void runWorker(NeuralNotePlugin* self)
                         r.swiftGraceStaleNote = -1;
                     }
                     if (r.swiftOnsetGrace > 0) {
-                        if (r.activeNotes && newBits != r.activeNotes) {
-                            // Mid-note transition: keep current note
+                        if (r.activeNotes && newBits && newBits != r.activeNotes) {
+                            // Mid-note transition: wrong note → keep current
                             newBits = r.activeNotes;
                             for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
                                 newVel[__builtin_ctzll(tmp)] = 100;
                         } else if (!r.activeNotes && newBits) {
                             const int detected = NOTE_BASE + __builtin_ctzll(newBits);
                             if (r.swiftGraceStaleNote < 0) {
-                                // Cycle 1: suppress and remember the stale note
                                 r.swiftGraceStaleNote = detected;
                                 newBits = 0;
                             } else if (detected == r.swiftGraceStaleNote) {
-                                // Cycle 2: same stale note → still suppress
                                 newBits = 0;
                             }
-                            // else: different note on cycle 2 → allow (real note)
                         }
                         --r.swiftOnsetGrace;
                     }
@@ -291,9 +288,10 @@ static void runWorker(NeuralNotePlugin* self)
                 // Cancel grace: first CNN cycle after a new provisional fires often
                 // contains mostly the previous note's audio.  Suppress that cancel so
                 // the next cycle (with a full window of the new note) decides instead.
-                // Skipped in swiftmono: SwiftF0 is fast enough to correct wrong
-                // provisionals immediately; onset grace handles mixed-audio transitions.
-                if (!swiftMono) {
+                // Re-enabled for swiftmono: now that the immediate path requires
+                // OBP==MPM agreement, provisionals are accurate and worth protecting
+                // for 1 cycle until SwiftF0 confirms.
+                {
                     if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
                         r.provLastSeenByCNN = provForDiff;
                         r.provCancelGrace   = 1;
@@ -668,33 +666,43 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                                                     static_cast<int>(nSamples),
                                                     static_cast<float>(self->sampleRate),
                                                     self->ranges);
+                    // MPM fallback: OBP expired with no vote — try MPM alone
+                    if (finalNote == -1 && !r.obdOnsetActive) {
+#ifdef NEURALNOTE_ENABLE_MPM
+                        const int mpmNote = r.mpm.analyze(
+                            static_cast<float>(self->sampleRate),
+                            r.cfg.midiLow, r.cfg.midiHigh);
+                        if (mpmNote != -1) {
+                            const bool mono = (self->modeVal.load(std::memory_order_relaxed) >= 1);
+                            bool suppress = false;
+                            if (mono) {
+                                for (auto& orp : self->ranges) {
+                                    if (&*orp == &r) continue;
+                                    if (orp->activeNotesBits.load(std::memory_order_acquire) != 0
+                                        || orp->provNote.load(std::memory_order_relaxed) != -1)
+                                        { suppress = true; break; }
+                                }
+                            }
+                            if (!suppress) fireProv(mpmNote);
+                        }
+#endif
+                    }
                     if (finalNote != -1) {
                         bool shouldFire = false;
 #ifdef NEURALNOTE_ENABLE_MPM
                         const int mpmNote = r.mpm.analyze(
                             static_cast<float>(self->sampleRate),
                             r.cfg.midiLow, r.cfg.midiHigh);
-                        if (mpmNote != -1) {
-                            // OBP confirms onset; trust MPM for the pitch.
-                            // Mono: suppress if any other range already has a provisional.
-                            // Poly: suppress if MPM's note is a harmonic (±12/24 semitones).
-                            const bool mono = (self->modeVal.load(std::memory_order_relaxed) >= 1);
-                            bool suppress = false;
-                            for (int oi = 0; oi < static_cast<int>(self->ranges.size()); ++oi) {
-                                if (oi == ri) continue;
-                                const int op2 = self->ranges[oi]->provNote.load(std::memory_order_relaxed);
-                                if (op2 != -1) {
-                                    if (mono) { suppress = true; break; }
-                                    const int ad = std::abs(mpmNote - op2);
-                                    if (ad == 12 || ad == 24) { suppress = true; break; }
-                                }
-                            }
-                            if (!suppress) {
-                                shouldFire = true;
-                                finalNote  = mpmNote;
-                            }
+                        if (mpmNote != -1 && mpmNote == finalNote) {
+                            // OBP + MPM agree — fire immediately
+                            shouldFire = true;
+                        } else if (mpmNote != -1) {
+                            // OBP + MPM disagree — save pending; retry with more data
+                            // (MPM at low fill can be inaccurate; pending retry trusts MPM)
+                            r.obdPendingNote   = finalNote;
+                            r.obdPendingRemain = static_cast<int>(self->sampleRate * 0.1f);
                         } else {
-                            // MPM not ready — save vote and retry next callbacks
+                            // MPM not ready — save pending
                             r.obdPendingNote   = finalNote;
                             r.obdPendingRemain = static_cast<int>(self->sampleRate * 0.1f);
                         }
@@ -725,9 +733,11 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         bool suppress = false;
                         for (int oi = 0; oi < static_cast<int>(self->ranges.size()); ++oi) {
                             if (&*self->ranges[oi] == &r) continue;
+                            if (mono && (self->ranges[oi]->activeNotesBits.load(std::memory_order_acquire) != 0
+                                         || self->ranges[oi]->provNote.load(std::memory_order_relaxed) != -1))
+                                { suppress = true; break; }
                             const int op2 = self->ranges[oi]->provNote.load(std::memory_order_relaxed);
                             if (op2 != -1) {
-                                if (mono) { suppress = true; break; }
                                 const int ad = std::abs(mpmNote - op2);
                                 if (ad == 12 || ad == 24) { suppress = true; break; }
                             }
