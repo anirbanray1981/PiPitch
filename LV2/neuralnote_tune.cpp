@@ -317,13 +317,17 @@ static void runWorker(Monitor* m)
                 if (r.swiftOnsetGrace > 0) {
                     if (!r.activeNotes && newBits) {
                         const int detected = NOTE_BASE + __builtin_ctzll(newBits);
-                        if (r.swiftGraceStaleNote < 0) {
-                            r.swiftGraceStaleNote = detected;
-                            newBits = 0;
-                            effectiveNote = -1;
-                        } else if (detected == r.swiftGraceStaleNote) {
-                            newBits = 0;
-                            effectiveNote = -1;
+                        const int tp = r.transitionProv.load(std::memory_order_acquire);
+                        // Don't suppress if consensus confirms (SwiftF0 == transitionProv)
+                        if (detected != tp) {
+                            if (r.swiftGraceStaleNote < 0) {
+                                r.swiftGraceStaleNote = detected;
+                                newBits = 0;
+                                effectiveNote = -1;
+                            } else if (detected == r.swiftGraceStaleNote) {
+                                newBits = 0;
+                                effectiveNote = -1;
+                            }
                         }
                     }
                     --r.swiftOnsetGrace;

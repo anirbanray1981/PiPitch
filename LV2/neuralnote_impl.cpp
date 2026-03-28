@@ -251,11 +251,15 @@ static void runWorker(NeuralNotePlugin* self)
                     if (r.swiftOnsetGrace > 0) {
                         if (!r.activeNotes && newBits) {
                             const int detected = NOTE_BASE + __builtin_ctzll(newBits);
-                            if (r.swiftGraceStaleNote < 0) {
-                                r.swiftGraceStaleNote = detected;
-                                newBits = 0;
-                            } else if (detected == r.swiftGraceStaleNote) {
-                                newBits = 0;
+                            const int tp = r.transitionProv.load(std::memory_order_acquire);
+                            // Don't suppress if consensus confirms (SwiftF0 == transitionProv)
+                            if (detected != tp) {
+                                if (r.swiftGraceStaleNote < 0) {
+                                    r.swiftGraceStaleNote = detected;
+                                    newBits = 0;
+                                } else if (detected == r.swiftGraceStaleNote) {
+                                    newBits = 0;
+                                }
                             }
                         }
                         --r.swiftOnsetGrace;
