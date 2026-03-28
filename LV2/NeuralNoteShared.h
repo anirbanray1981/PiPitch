@@ -58,6 +58,69 @@ static constexpr float ONSET_RATIO    = 3.0f;   // RMS must exceed background ×
 static constexpr float ONSET_ALPHA    = 0.05f;  // background tracker time constant
 static constexpr float ONSET_BLANK_MS = 25.0f;  // re-trigger suppression window
 
+// ── HPF pick detector ─────────────────────────────────────────────────────────
+//
+// Detects pick attacks via high-frequency attack slope.  A 1st-order IIR HPF
+// at ~3 kHz isolates the broadband "snap" of a pick hitting a string.  Two
+// envelope EMAs at different speeds track the HPF output:
+//   - envFast (~0.3 ms): responds to transients within 1 ms
+//   - envSlow (~5 ms):   smooths out harmonic oscillations
+// A pick creates a large gap (fast >> slow).  Harmonic beating keeps them close.
+
+struct PickDetector {
+    float hpfPrev    = 0.0f;    // x[n-1]
+    float hpfOut     = 0.0f;    // y[n-1]
+    float hpfAlpha   = 0.0f;    // HPF coefficient
+
+    float envFast    = 1e-6f;   // fast envelope (~0.3 ms)
+    float envSlow    = 1e-6f;   // slow envelope (~5 ms)
+    float fastAlpha  = 0.0f;    // EMA coefficient for fast
+    float slowAlpha  = 0.0f;    // EMA coefficient for slow
+
+    float slopeRatio = 10.0f;   // fast/slow threshold to fire
+    int   blankTotal = 0;       // suppression window (samples)
+    int   blankRemain = 0;      // remaining suppression samples
+
+    void init(float sampleRate, float cutoffHz = 3000.0f,
+              float ratio = 4.0f, float blankMs = 25.0f)
+    {
+        const float dt = 1.0f / sampleRate;
+        const float RC = 1.0f / (2.0f * 3.14159265f * cutoffHz);
+        hpfAlpha   = RC / (RC + dt);
+        fastAlpha  = 1.0f - std::exp(-1.0f / (sampleRate * 0.0001f));  // ~0.1 ms
+        slowAlpha  = 1.0f - std::exp(-1.0f / (sampleRate * 0.02f));   // ~20 ms
+        slopeRatio = ratio;
+        blankTotal = static_cast<int>(sampleRate * blankMs / 1000.0f);
+    }
+
+    // Process a buffer.  Returns the sample index where a pick was detected,
+    // or -1 if none.  Also writes the fast/slow ratio at the trigger point.
+    int process(const float* audio, int nSamples, float& ratioOut)
+    {
+        for (int i = 0; i < nSamples; ++i) {
+            // 1st-order IIR HPF: y[n] = α·(y[n-1] + x[n] - x[n-1])
+            hpfOut  = hpfAlpha * (hpfOut + audio[i] - hpfPrev);
+            hpfPrev = audio[i];
+
+            const float absHpf = std::fabs(hpfOut);
+
+            // Dual-EMA envelope tracking
+            envFast += fastAlpha * (absHpf - envFast);
+            envSlow += slowAlpha * (absHpf - envSlow);
+
+            if (blankRemain > 0) { --blankRemain; continue; }
+
+            if (envSlow > 1e-7f && envFast > envSlow * slopeRatio) {
+                blankRemain = blankTotal;
+                ratioOut    = envFast / envSlow;
+                envSlow     = envFast;  // snap slow to fast; must rebuild gap
+                return i;
+            }
+        }
+        return -1;
+    }
+};
+
 // ── MIDI output queue ─────────────────────────────────────────────────────────
 
 static constexpr int MIDI_QUEUE_CAP = 64; // events between audio callbacks; 64 is ample
@@ -117,6 +180,7 @@ struct SnapshotChannel {
     int                snapshotSize       = 0;
     int                provNoteAtDispatch = -1;
     double             provOnMs           = 0.0;
+    bool               onsetDispatched    = false;  // true if this snapshot was force-dispatched by an onset
     std::atomic<bool>  ready{false};
     std::atomic<bool>  quit{false};
     sem_t              sem;
@@ -176,6 +240,12 @@ struct RangeStateBase {
     int                 provLastSeenByCNN  = -1;   // last provisional note the worker processed
     int                 provCancelGrace    = 0;    // cancel-suppression cycles remaining
 
+    // Worker-only: first SwiftF0 cycle(s) after onset contain stale ring audio.
+    // Grace suppresses detections: mid-note keeps current note; from-silence
+    // suppresses cycle 1 and remembers the stale note; cycle 2 allows if different.
+    int                 swiftOnsetGrace    = 0;
+    int                 swiftGraceStaleNote = -1;  // note suppressed on grace cycle 1
+
 #ifdef NEURALNOTE_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
 #endif
@@ -208,24 +278,30 @@ static void pushRingSamples(RangeT& r, const float* samples, int count) noexcept
 // ── OBP onset arm / expire ────────────────────────────────────────────────────
 //
 // Call once per audio callback per range (before the OBP active block).
-// On onset: arms OBP window, clears HPS register and blacklist, resets MPM.
+// On first onset: arms OBP window, clears HPS register and blacklist, resets MPM.
+// On re-trigger onset (already active): extends window only — does NOT reset OBP/voting
+//   state, so accumulated readings are preserved.
 // On countdown: decrements obdWindowRemain; disarms when it reaches zero.
 
 template<typename RangeT>
 static void armOrExpireOBP(RangeT& r, float sampleRate, int nSamples, bool onsetFired) noexcept
 {
     if (onsetFired) {
-        r.obdBlacklistNote.store(-1, std::memory_order_relaxed);
-        r.obpHpsBits         = 0;
-        r.obdOnsetActive     = true;
-        r.obdWindowRemain    = static_cast<int>(sampleRate * 0.1f);  // 100 ms window
-        r.obdPendingNote     = -1;
-        r.obdPendingRemain   = 0;
-        r.obdVoting.reset();
-        r.obd.reset();
+        if (!r.obdOnsetActive) {
+            // First onset: full reset
+            r.obdBlacklistNote.store(-1, std::memory_order_relaxed);
+            r.obpHpsBits         = 0;
+            r.obdPendingNote     = -1;
+            r.obdPendingRemain   = 0;
+            r.obdVoting.reset();
+            r.obd.resetDetection();
 #ifdef NEURALNOTE_ENABLE_MPM
-        r.mpm.reset();
+            r.mpm.reset();
 #endif
+        }
+        // Arm / extend window (both first onset and re-triggers)
+        r.obdOnsetActive  = true;
+        r.obdWindowRemain = static_cast<int>(sampleRate * 0.1f);  // 100 ms window
     } else if (r.obdWindowRemain > 0) {
         r.obdWindowRemain  -= nSamples;
         if (r.obdWindowRemain <= 0) {
@@ -294,6 +370,18 @@ static int runOBPHPS(RangeT& r,
     while (r.obdOnsetActive && obpRem > 0) {
         const int chunk = std::min(obpRem, OBP_CHUNK);
         const int op    = r.obd.process(obpPtr, chunk, sampleRate);
+
+#ifdef OBP_DIAG
+        // Diagnostic: log every raw OBP reading for the lowest range
+        if (op != -1 && r.cfg.midiHigh <= 47) {
+            const bool inRange = (op >= r.cfg.midiLow && op <= r.cfg.midiHigh && op <= OBP_NOTE_CAP);
+            std::printf("  OBP-raw: midi=%2d %s  voting: note=%d run=%d/%d  period=%d\n",
+                        op, inRange ? "IN " : "OUT",
+                        r.obdVoting.note, r.obdVoting.run, OBPVotingBuffer::N_CONSEC,
+                        r.obd.buf[0]);
+            std::fflush(stdout);
+        }
+#endif
 
         // Accumulate all in-bitmap detections for the HPS register
         if (op >= NOTE_BASE && op < NOTE_BASE + NOTE_COUNT)
@@ -390,6 +478,7 @@ static void dispatchSnapshotIfReady(
     r.snapChan.snapshotSize       = rs;
     r.snapChan.provNoteAtDispatch = r.provNote.load(std::memory_order_relaxed);
     r.snapChan.provOnMs           = provOnMs;
+    r.snapChan.onsetDispatched    = onsetFired;
     r.snapChan.ready.store(true, std::memory_order_release);
     r.freshSamples = 0;
     sem_post(&workerSem);
@@ -436,8 +525,11 @@ static void buildNNBits(RangeStateBase& r, float ampFloor,
 // No logging — callers may compare activeNotes before/after if they need logs.
 
 static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
-                           const int8_t* newVel, int prov, bool mono = false) noexcept
+                           const int8_t* newVel, int prov, bool mono = false,
+                           int holdCyclesOverride = -1) noexcept
 {
+    const int holdCycles = (holdCyclesOverride >= 0) ? holdCyclesOverride
+                                                     : r.cfg.holdCycles;
     // Mono mode: reduce CNN result to single highest-velocity note in this range
     if (mono && newBits) {
         int8_t bestVel = 0; int bestBit = -1;
@@ -493,9 +585,9 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
         const int  bit          = __builtin_ctzll(tmp);
         const bool cancelledProv = (prov != -1 && (NOTE_BASE + bit) == prov
                                     && !bmTest(newBits, prov));
-        if (r.cfg.holdCycles > 0 && !cancelledProv) {
+        if (holdCycles > 0 && !cancelledProv) {
             r.holdNotes      |= (1ULL << bit);
-            r.holdCounts[bit]  = static_cast<int8_t>(r.cfg.holdCycles);
+            r.holdCounts[bit]  = static_cast<int8_t>(holdCycles);
         } else {
             r.midiOut.push({false, NOTE_BASE + bit, 0});
             r.activeNotes &= ~(1ULL << bit);

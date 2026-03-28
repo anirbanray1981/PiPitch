@@ -113,8 +113,9 @@ struct SynthVoice {
 
 struct RangeState : RangeStateBase {
     // tune-specific fields
-    int    provMidiPitch = -1;   // set by OBP, consumed by processSynth this callback
-    double provOnTimeMs  = 0.0;  // ms since startTime when provisional fired
+    int    provMidiPitch    = -1;   // set by OBP, consumed by processSynth this callback
+    double provOnTimeMs     = 0.0;  // ms since startTime when provisional fired
+    int    lastSwiftPrint   = -2;   // last SwiftF0 note printed (-1=silent, -2=none yet)
 };
 
 // ── Shared state ───────────────────────────────────────────────────────────────
@@ -144,6 +145,13 @@ struct Monitor {
     float onsetSmoothedRms = 0.001f;
     float onsetBlankMs     = 25.0f;  // re-trigger suppression window (ms)
     int   onsetBlankRemain = 0;      // raw input samples remaining in blank period
+
+    // HPF pick detector (jackProcess thread only)
+    PickDetector pickDetector;
+
+    // Onset-recency tracking (audio → worker, for decay-tail ghost suppression)
+    std::atomic<uint64_t> totalSamples{0};
+    std::atomic<uint64_t> lastOnsetSample{0};
 
     // Per-range OBP provisional note fired this onset (-1 if none); cleared on each onset.
     // Used for cross-range harmonic suppression.
@@ -270,6 +278,7 @@ static void runWorker(Monitor* m)
                 // SwiftF0 path: resample snapshot 22050→16000 Hz, run inference.
                 const float* src    = r.snapChan.data.data();
                 const int    srcLen = r.snapChan.snapshotSize;
+                const bool   wasOnset = r.snapChan.onsetDispatched;
                 constexpr double SF0_SR = 16000.0;
                 const double ratio  = SF0_SR / PLUGIN_SR;
                 const int    dstLen = static_cast<int>(srcLen * ratio);
@@ -289,23 +298,82 @@ static void runWorker(Monitor* m)
                 inferMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
 
-                const double elapsed = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - m->startTime).count();
+                int effectiveNote = -1;  // -1 = silent
                 if (midiNote >= r.cfg.midiLow && midiNote <= r.cfg.midiHigh &&
                     midiNote >= NOTE_BASE && midiNote < NOTE_BASE + NOTE_COUNT) {
-                    std::printf("[+%.3fs]  --   SwiftF0 → %-4s (%3d)"
-                                "  [inf %4.0fms  range %s]\n",
-                                elapsed, midiToName(midiNote).c_str(), midiNote,
-                                inferMs, r.cfg.name.c_str());
+                    effectiveNote = midiNote;
                     const int bit = midiNote - NOTE_BASE;
                     newBits    = 1ULL << bit;
                     newVel[bit] = 100;
-                } else {
-                    std::printf("[+%.3fs]  --   SwiftF0 → silent"
-                                "  [inf %4.0fms  range %s]\n",
-                                elapsed, inferMs, r.cfg.name.c_str());
                 }
-                std::fflush(stdout);
+
+                // Onset-transition grace: the first snapshot(s) after an onset
+                // contain stale ring audio.  Two cases:
+                //   Mid-note: keep current note for 1 cycle (half-step suppression).
+                //   From silence: suppress cycle 1 and remember the stale note;
+                //     cycle 2 allows immediately if a DIFFERENT note is detected
+                //     (it's the real new note), or suppresses if same stale note.
+                if (wasOnset && r.swiftOnsetGrace <= 0) {
+                    r.swiftOnsetGrace = 2;
+                    r.swiftGraceStaleNote = -1;
+                }
+                if (r.swiftOnsetGrace > 0) {
+                    if (r.activeNotes && newBits != r.activeNotes) {
+                        // Mid-note transition: keep current note
+                        newBits = r.activeNotes;
+                        effectiveNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
+                        for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                            newVel[__builtin_ctzll(tmp)] = 100;
+                    } else if (!r.activeNotes && newBits) {
+                        const int detected = NOTE_BASE + __builtin_ctzll(newBits);
+                        if (r.swiftGraceStaleNote < 0) {
+                            // Cycle 1: suppress and remember the stale note
+                            r.swiftGraceStaleNote = detected;
+                            newBits = 0;
+                            effectiveNote = -1;
+                        } else if (detected == r.swiftGraceStaleNote) {
+                            // Cycle 2: same stale note → still suppress
+                            newBits = 0;
+                            effectiveNote = -1;
+                        }
+                        // else: different note on cycle 2 → allow (real note)
+                    }
+                    --r.swiftOnsetGrace;
+                }
+
+                // Decay-tail ghost suppression: if SwiftF0 wants to create a
+                // new note-ON but no onset fired recently, this is likely a
+                // harmonic from a decaying string.  In mono/swiftmono every
+                // legitimate new note starts with an onset.
+                if (newBits & ~r.activeNotes) {
+                    const uint64_t elapsed =
+                        m->totalSamples.load(std::memory_order_relaxed)
+                        - m->lastOnsetSample.load(std::memory_order_acquire);
+                    constexpr double ONSET_GATE_S = 0.25;
+                    const auto gate = static_cast<uint64_t>(m->sampleRate * ONSET_GATE_S);
+                    if (elapsed > gate) {
+                        newBits = 0;
+                        effectiveNote = -1;
+                    }
+                }
+
+                // Only print when the detected note changes for this range.
+                if (effectiveNote != r.lastSwiftPrint) {
+                    r.lastSwiftPrint = effectiveNote;
+                    const double elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - m->startTime).count();
+                    if (effectiveNote >= 0) {
+                        std::printf("[+%.3fs]  --   SwiftF0 → %-4s (%3d)"
+                                    "  [inf %4.0fms  range %s]\n",
+                                    elapsed, midiToName(effectiveNote).c_str(),
+                                    effectiveNote, inferMs, r.cfg.name.c_str());
+                    } else {
+                        std::printf("[+%.3fs]  --   SwiftF0 → silent"
+                                    "  [inf %4.0fms  range %s]\n",
+                                    elapsed, inferMs, r.cfg.name.c_str());
+                    }
+                    std::fflush(stdout);
+                }
             } else {
                 // BasicPitch (CNN) path.
                 const auto t0 = std::chrono::steady_clock::now();
@@ -321,24 +389,29 @@ static void runWorker(Monitor* m)
             // Cancel grace: first inference cycle after a new provisional fires often
             // contains mostly the previous note's audio.  Suppress that cancel so
             // the next cycle (with a full window of the new note) decides instead.
-            if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
-                r.provLastSeenByCNN = provForDiff;
-                r.provCancelGrace   = 1;
-            }
-            if (provForDiff != -1 && r.provCancelGrace > 0) {
-                const int bit = provForDiff - NOTE_BASE;
-                if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
-                    --r.provCancelGrace;
-                    newBits    |= (1ULL << bit);  // suppress cancel; note already playing
-                    newVel[bit] = 64;             // velocity unused (no new note-ON fired)
-                } else {
-                    r.provCancelGrace = 0;  // confirmed naturally
+            // Skipped in swiftmono: SwiftF0 is fast enough to correct wrong
+            // provisionals immediately; onset grace handles mixed-audio transitions.
+            if (!swiftMono) {
+                if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
+                    r.provLastSeenByCNN = provForDiff;
+                    r.provCancelGrace   = 1;
+                }
+                if (provForDiff != -1 && r.provCancelGrace > 0) {
+                    const int bit = provForDiff - NOTE_BASE;
+                    if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
+                        --r.provCancelGrace;
+                        newBits    |= (1ULL << bit);  // suppress cancel; note already playing
+                        newVel[bit] = 64;             // velocity unused (no new note-ON fired)
+                    } else {
+                        r.provCancelGrace = 0;  // confirmed naturally
+                    }
                 }
             }
 
             if (swiftMono) {
                 // SwiftF0 path: call state machine directly (SwiftF0 log already printed above).
-                applyNotesDiff(r, newBits, newVel, provForDiff, mono);
+                applyNotesDiff(r, newBits, newVel, provForDiff, mono,
+                               r.cfg.swiftHoldCycles);
                 const double elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - m->startTime).count();
                 for (uint64_t tmp = r.activeNotes & ~prevActive; tmp; tmp &= tmp - 1) {
@@ -542,16 +615,58 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     const float blockRms = std::sqrt(sumSq / static_cast<float>(nFrames));
     const bool  gated    = (blockRms < m->gateFloor);
 
-    // Onset detection: force-dispatch all ready rings when a pick attack is detected.
+    // Onset detection: HPF pick detector is primary, RMS is fallback.
+    m->totalSamples.fetch_add(nFrames, std::memory_order_relaxed);
     bool onsetFired = false;
-    if (m->onsetBlankRemain > 0) {
-        m->onsetBlankRemain -= static_cast<int>(nFrames);
-        if (m->onsetBlankRemain < 0) m->onsetBlankRemain = 0;
-    } else if (!gated && blockRms > m->onsetSmoothedRms * ONSET_RATIO) {
-        onsetFired            = true;
-        m->onsetBlankRemain   = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
-        m->onsetSmoothedRms   = blockRms;
-        m->onsetProvNotes.fill(-1);  // new onset: reset cross-range provisional tracking
+
+    // Primary: HPF pick detector with two-tier confirmation.
+    //   Tier 1 (ratio ≥ 10): high confidence — immediate onset.
+    //   Tier 2 (ratio 4–10): tentative — confirmed only if RMS also agrees.
+    constexpr float PICK_HIGH_TIER = 10.0f;
+    int  pickSample   = -1;
+    float pickRatioVal = 0.0f;
+    if (!gated)
+        pickSample = m->pickDetector.process(in, static_cast<int>(nFrames), pickRatioVal);
+
+    const bool rmsWouldFire = !gated && m->onsetBlankRemain <= 0
+                              && blockRms > m->onsetSmoothedRms * ONSET_RATIO;
+
+    if (pickSample >= 0 && (pickRatioVal >= PICK_HIGH_TIER || rmsWouldFire)) {
+        onsetFired          = true;
+        m->onsetBlankRemain = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
+        m->onsetSmoothedRms = blockRms;
+        m->lastOnsetSample.store(
+            m->totalSamples.load(std::memory_order_relaxed)
+                - static_cast<uint64_t>(nFrames) + static_cast<uint64_t>(pickSample),
+            std::memory_order_release);
+        m->onsetProvNotes.fill(-1);
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m->startTime).count();
+        const double offsetMs = pickSample / m->sampleRate * 1000.0;
+        std::printf("[+%.3fs]  --   PICK onset  (sample %d/%u  +%.1fms  ratio %.1f%s)\n",
+                    elapsed, pickSample, nFrames, offsetMs, pickRatioVal,
+                    pickRatioVal < PICK_HIGH_TIER ? "  +RMS" : "");
+        std::fflush(stdout);
+    }
+
+    // Fallback: RMS onset (hammer-ons, volume swells, etc.)
+    if (!onsetFired) {
+        if (m->onsetBlankRemain > 0) {
+            m->onsetBlankRemain -= static_cast<int>(nFrames);
+            if (m->onsetBlankRemain < 0) m->onsetBlankRemain = 0;
+        } else if (rmsWouldFire) {
+            onsetFired            = true;
+            m->onsetBlankRemain   = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
+            m->onsetSmoothedRms   = blockRms;
+            m->lastOnsetSample.store(m->totalSamples.load(std::memory_order_relaxed),
+                                     std::memory_order_release);
+            m->onsetProvNotes.fill(-1);
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - m->startTime).count();
+            std::printf("[+%.3fs]  --   RMS onset  (rms %.4f / bg %.4f)\n",
+                        elapsed, blockRms, m->onsetSmoothedRms / ONSET_RATIO);
+            std::fflush(stdout);
+        }
     }
     if (!onsetFired && m->onsetBlankRemain == 0)
         m->onsetSmoothedRms = m->onsetSmoothedRms * (1.0f - ONSET_ALPHA) + blockRms * ONSET_ALPHA;
@@ -811,12 +926,13 @@ int main(int argc, char** argv)
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
                 MIN_FRESH_FLOOR / static_cast<float>(PLUGIN_SR) * 1000.0f);
     std::printf("\nNote ranges (%zu, single worker thread):\n", rangeCfg.ranges.size());
-    std::printf("  %-12s  %4s  %4s  %6s  %3s  %s\n",
-                "Name","Low","High","WinMs","MNL","Hold");
+    std::printf("  %-12s  %4s  %4s  %6s  %3s  %4s  %s\n",
+                "Name","Low","High","WinMs","MNL","Hold","SfHd");
     for (const auto& r : rangeCfg.ranges)
-        std::printf("  %-12s  %4d  %4d  %6.0f  %3d  %d\n",
+        std::printf("  %-12s  %4d  %4d  %6.0f  %3d  %4d  %d\n",
                     r.name.c_str(), r.midiLow, r.midiHigh,
-                    r.windowMs, r.minNoteLength, r.holdCycles);
+                    r.windowMs, r.minNoteLength, r.holdCycles,
+                    r.swiftHoldCycles);
     const char* wfName = waveform == Waveform::SAW ? "saw" : waveform == Waveform::SQUARE ? "square" : "sine";
     std::printf("\nWaveform:   %s  Attack: %.0f ms  Release: %.0f ms  Volume: %.2f\n\n",
                 wfName, attackMs, releaseMs, masterVol);
@@ -883,10 +999,13 @@ int main(int argc, char** argv)
     mon.sampleRate = jack_get_sample_rate(client);
     std::printf("JACK:       %.0f Hz, buffer %u frames\n", mon.sampleRate, jack_get_buffer_size(client));
 
+    // Configure HPF pick detector.
+    mon.pickDetector.init(static_cast<float>(mon.sampleRate));
+
     // Configure per-range OBP lowpass and MPM (both need sample rate).
     for (auto& rp : mon.ranges) {
         const float sr     = static_cast<float>(mon.sampleRate);
-        const float cutoff = std::min(midiToFreq(rp->cfg.midiHigh) * 1.5f, sr * 0.45f);
+        const float cutoff = std::min(midiToFreq(rp->cfg.midiHigh) * 1.2f, sr * 0.45f);
         rp->obd.setLowpass(cutoff, sr);
         rp->mpm.init(sr, rp->cfg.midiLow, rp->cfg.midiHigh);
     }

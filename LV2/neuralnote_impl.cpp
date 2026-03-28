@@ -140,6 +140,13 @@ struct NeuralNotePlugin {
     float onsetSmoothedRms = 0.001f;
     int   onsetBlankRemain = 0;
 
+    // HPF pick detector (run() thread only)
+    PickDetector pickDetector;
+
+    // Onset-recency tracking (audio → worker, for decay-tail ghost suppression)
+    std::atomic<uint64_t> totalSamples{0};
+    std::atomic<uint64_t> lastOnsetSample{0};
+
     // Single worker thread shared across all ranges
     std::thread       workerThread;
     std::atomic<bool> workerQuit{false};
@@ -205,6 +212,7 @@ static void runWorker(NeuralNotePlugin* self)
                     // SwiftF0 path: resample 22050→16000 Hz, run ONNX inference.
                     const float* src    = r.snapChan.data.data();
                     const int    srcLen = r.snapChan.snapshotSize;
+                    const bool   wasOnset = r.snapChan.onsetDispatched;
                     constexpr double SF0_SR = 16000.0;
                     const double ratio  = SF0_SR / PLUGIN_SR;
                     const int    dstLen = static_cast<int>(srcLen * ratio);
@@ -227,6 +235,51 @@ static void runWorker(NeuralNotePlugin* self)
                         newBits    = 1ULL << bit;
                         newVel[bit] = 100;
                     }
+
+                    // Onset-transition grace: the first snapshot(s) after an onset
+                    // contain stale ring audio.  Two cases:
+                    //   Mid-note: keep current note for 1 cycle (half-step suppression).
+                    //   From silence: suppress cycle 1 and remember the stale note;
+                    //     cycle 2 allows immediately if a DIFFERENT note is detected
+                    //     (it's the real new note), or suppresses if same stale note.
+                    if (wasOnset && r.swiftOnsetGrace <= 0) {
+                        r.swiftOnsetGrace = 2;
+                        r.swiftGraceStaleNote = -1;
+                    }
+                    if (r.swiftOnsetGrace > 0) {
+                        if (r.activeNotes && newBits != r.activeNotes) {
+                            // Mid-note transition: keep current note
+                            newBits = r.activeNotes;
+                            for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                                newVel[__builtin_ctzll(tmp)] = 100;
+                        } else if (!r.activeNotes && newBits) {
+                            const int detected = NOTE_BASE + __builtin_ctzll(newBits);
+                            if (r.swiftGraceStaleNote < 0) {
+                                // Cycle 1: suppress and remember the stale note
+                                r.swiftGraceStaleNote = detected;
+                                newBits = 0;
+                            } else if (detected == r.swiftGraceStaleNote) {
+                                // Cycle 2: same stale note → still suppress
+                                newBits = 0;
+                            }
+                            // else: different note on cycle 2 → allow (real note)
+                        }
+                        --r.swiftOnsetGrace;
+                    }
+
+                    // Decay-tail ghost suppression: if SwiftF0 wants to create a
+                    // new note-ON but no onset fired recently, this is likely a
+                    // harmonic from a decaying string.  In mono/swiftmono every
+                    // legitimate new note starts with an onset.
+                    if (newBits & ~r.activeNotes) {
+                        const uint64_t elapsed =
+                            self->totalSamples.load(std::memory_order_relaxed)
+                            - self->lastOnsetSample.load(std::memory_order_acquire);
+                        constexpr double ONSET_GATE_S = 0.25;
+                        const auto gate = static_cast<uint64_t>(self->sampleRate * ONSET_GATE_S);
+                        if (elapsed > gate)
+                            newBits = 0;
+                    }
                 } else {
                     r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
                                                     r.snapChan.snapshotSize);
@@ -238,22 +291,27 @@ static void runWorker(NeuralNotePlugin* self)
                 // Cancel grace: first CNN cycle after a new provisional fires often
                 // contains mostly the previous note's audio.  Suppress that cancel so
                 // the next cycle (with a full window of the new note) decides instead.
-                if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
-                    r.provLastSeenByCNN = provForDiff;
-                    r.provCancelGrace   = 1;
-                }
-                if (provForDiff != -1 && r.provCancelGrace > 0) {
-                    const int bit = provForDiff - NOTE_BASE;
-                    if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
-                        --r.provCancelGrace;
-                        newBits    |= (1ULL << bit);  // suppress cancel; note already playing
-                        newVel[bit] = 64;             // velocity unused (no new note-ON fired)
-                    } else {
-                        r.provCancelGrace = 0;  // CNN confirmed naturally
+                // Skipped in swiftmono: SwiftF0 is fast enough to correct wrong
+                // provisionals immediately; onset grace handles mixed-audio transitions.
+                if (!swiftMono) {
+                    if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
+                        r.provLastSeenByCNN = provForDiff;
+                        r.provCancelGrace   = 1;
+                    }
+                    if (provForDiff != -1 && r.provCancelGrace > 0) {
+                        const int bit = provForDiff - NOTE_BASE;
+                        if (bit >= 0 && bit < NOTE_COUNT && !(newBits & (1ULL << bit))) {
+                            --r.provCancelGrace;
+                            newBits    |= (1ULL << bit);  // suppress cancel; note already playing
+                            newVel[bit] = 64;             // velocity unused (no new note-ON fired)
+                        } else {
+                            r.provCancelGrace = 0;  // CNN confirmed naturally
+                        }
                     }
                 }
 
-                applyNotesDiff(r, newBits, newVel, provForDiff, mono);
+                applyNotesDiff(r, newBits, newVel, provForDiff, mono,
+                               swiftMono ? r.cfg.swiftHoldCycles : -1);
 
                 // Mono cross-range: new note-ON(s) in this range → kill all other ranges
                 if (mono && (r.activeNotes & ~prevActive)) {
@@ -385,7 +443,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
                                      self->thresholdVal.load(std::memory_order_relaxed), minDurMs);
         // Configure per-range OBP lowpass
         const float sr     = static_cast<float>(rate);
-        const float cutoff = std::min(440.0f * std::pow(2.0f, (cfg.midiHigh - 69) / 12.0f) * 1.5f,
+        const float cutoff = std::min(440.0f * std::pow(2.0f, (cfg.midiHigh - 69) / 12.0f) * 1.2f,
                                       sr * 0.45f);
         r->obd.setLowpass(cutoff, sr);
 #ifdef NEURALNOTE_ENABLE_MPM
@@ -410,6 +468,8 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         def.windowMs = 150.0f; def.minNoteLength = 6; def.holdCycles = 2;
         self->ranges.push_back(makeRange(def));
     }
+
+    self->pickDetector.init(static_cast<float>(rate));
 
     sem_init(&self->workerSem, 0, 0);
     self->workerThread = std::thread(runWorker, self);
@@ -506,18 +566,49 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     const float blockRms = std::sqrt(sumSq / static_cast<float>(nSamples));
     const bool  gated    = (blockRms < gateFloor);
 
-    // Onset: fire a force-dispatch when the block RMS jumps above ONSET_RATIO × background.
-    // A 50 ms blank prevents re-triggering on the same note.
+    // Onset detection: HPF pick detector is primary, RMS is fallback.
+    self->totalSamples.fetch_add(nSamples, std::memory_order_relaxed);
     bool onsetFired = false;
-    if (self->onsetBlankRemain > 0) {
-        self->onsetBlankRemain -= static_cast<int>(nSamples);
-        if (self->onsetBlankRemain < 0) self->onsetBlankRemain = 0;
-    } else if (!gated && blockRms > self->onsetSmoothedRms * ONSET_RATIO) {
-        onsetFired             = true;
-        const float blankMs    = (self->onsetBlankMsPort && *self->onsetBlankMsPort > 0.0f)
-                                     ? *self->onsetBlankMsPort : ONSET_BLANK_MS;
+
+    // Primary: HPF pick detector with two-tier confirmation.
+    //   Tier 1 (ratio ≥ 10): high confidence — immediate onset.
+    //   Tier 2 (ratio 4–10): tentative — confirmed only if RMS also agrees.
+    constexpr float PICK_HIGH_TIER = 10.0f;
+    int   pickSample = -1;
+    float pickRatio  = 0.0f;
+    if (!gated)
+        pickSample = self->pickDetector.process(
+            self->audioIn, static_cast<int>(nSamples), pickRatio);
+
+    const bool rmsWouldFire = !gated && self->onsetBlankRemain <= 0
+                              && blockRms > self->onsetSmoothedRms * ONSET_RATIO;
+
+    if (pickSample >= 0 && (pickRatio >= PICK_HIGH_TIER || rmsWouldFire)) {
+        onsetFired = true;
+        const float blankMs = (self->onsetBlankMsPort && *self->onsetBlankMsPort > 0.0f)
+                                  ? *self->onsetBlankMsPort : ONSET_BLANK_MS;
         self->onsetBlankRemain = static_cast<int>(self->sampleRate * (blankMs / 1000.0f));
-        self->onsetSmoothedRms = blockRms; // jump to current level to suppress immediate re-trigger
+        self->onsetSmoothedRms = blockRms;
+        self->lastOnsetSample.store(
+            self->totalSamples.load(std::memory_order_relaxed)
+                - static_cast<uint64_t>(nSamples) + static_cast<uint64_t>(pickSample),
+            std::memory_order_release);
+    }
+
+    // Fallback: RMS onset (hammer-ons, volume swells, etc.)
+    if (!onsetFired) {
+        if (self->onsetBlankRemain > 0) {
+            self->onsetBlankRemain -= static_cast<int>(nSamples);
+            if (self->onsetBlankRemain < 0) self->onsetBlankRemain = 0;
+        } else if (rmsWouldFire) {
+            onsetFired             = true;
+            const float blankMs    = (self->onsetBlankMsPort && *self->onsetBlankMsPort > 0.0f)
+                                         ? *self->onsetBlankMsPort : ONSET_BLANK_MS;
+            self->onsetBlankRemain = static_cast<int>(self->sampleRate * (blankMs / 1000.0f));
+            self->onsetSmoothedRms = blockRms;
+            self->lastOnsetSample.store(self->totalSamples.load(std::memory_order_relaxed),
+                                        std::memory_order_release);
+        }
     }
     if (!onsetFired && self->onsetBlankRemain == 0)
         self->onsetSmoothedRms = self->onsetSmoothedRms * (1.0f - ONSET_ALPHA) + blockRms * ONSET_ALPHA;

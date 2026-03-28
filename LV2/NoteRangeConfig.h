@@ -22,6 +22,7 @@
  *   window          = 120
  *   min_note_length = 6
  *   hold_cycles     = 4
+ *   swift_hold_cycles = 2
  *
  *   [range]
  *   name            = C3-B3
@@ -48,6 +49,7 @@ struct NoteRange {
     float windowMs           = 150.0f;
     int   minNoteLength      = 6;      // CNN frames
     int   holdCycles         = 2;      // inference cycles to hold OFF for this range
+    int   swiftHoldCycles    = 2;      // hold cycles when using SwiftF0 (faster cycle time)
 };
 
 struct RangeConfig {
@@ -126,7 +128,8 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
         else if (key == "midi_high")       cur->midiHigh      = std::stoi(val);
         else if (key == "window")          cur->windowMs      = std::stof(val);
         else if (key == "min_note_length") cur->minNoteLength = std::stoi(val);
-        else if (key == "hold_cycles")     cur->holdCycles    = std::stoi(val);
+        else if (key == "hold_cycles")       cur->holdCycles      = std::stoi(val);
+        else if (key == "swift_hold_cycles") cur->swiftHoldCycles = std::stoi(val);
     }
 
     std::fclose(f);
