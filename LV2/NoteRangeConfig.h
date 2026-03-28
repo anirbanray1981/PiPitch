@@ -11,8 +11,9 @@
  *   amp_floor       = 0.65
  *   threshold       = 0.6
  *   frame_threshold = 0.5
- *   mode            = poly    # or mono
+ *   mode            = poly    # or mono, swiftmono
  *   onset_blank_ms  = 25      # re-trigger suppression window (ms)
+ *   swift_threshold = 0.5     # SwiftF0 per-frame confidence threshold (swiftmono mode)
  *
  *   [range]
  *   name            = E2-B2
@@ -38,7 +39,7 @@
 #include <string>
 #include <vector>
 
-enum class PlayMode { POLY, MONO };
+enum class PlayMode { POLY, MONO, SWIFT_MONO };
 
 struct NoteRange {
     std::string name         = "default";
@@ -55,7 +56,8 @@ struct RangeConfig {
     float     ampFloor       = 0.65f;
     float     threshold      = 0.6f;   // onset sensitivity (0.05–0.95)
     float     frameThreshold = 0.5f;   // frame confidence (0.05–0.95)
-    float     onsetBlankMs   = 25.0f;  // re-trigger suppression window (ms)
+    float     onsetBlankMs      = 25.0f;  // re-trigger suppression window (ms)
+    float     swiftF0Threshold  = 0.5f;   // SwiftF0 per-frame confidence (swiftmono mode)
     PlayMode  mode           = PlayMode::MONO;
 };
 
@@ -108,9 +110,12 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
         if (key == "amp_floor")       { cfg.ampFloor       = std::stof(val); continue; }
         if (key == "threshold")       { cfg.threshold      = std::stof(val); continue; }
         if (key == "frame_threshold") { cfg.frameThreshold = std::stof(val); continue; }
-        if (key == "onset_blank_ms") { cfg.onsetBlankMs = std::stof(val); continue; }
+        if (key == "onset_blank_ms")  { cfg.onsetBlankMs     = std::stof(val); continue; }
+        if (key == "swift_threshold") { cfg.swiftF0Threshold = std::stof(val); continue; }
         if (key == "mode") {
-            cfg.mode = (val == "mono") ? PlayMode::MONO : PlayMode::POLY;
+            if      (val == "mono")      cfg.mode = PlayMode::MONO;
+            else if (val == "swiftmono") cfg.mode = PlayMode::SWIFT_MONO;
+            else                         cfg.mode = PlayMode::POLY;
             continue;
         }
 

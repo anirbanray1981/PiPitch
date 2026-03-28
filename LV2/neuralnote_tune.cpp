@@ -50,6 +50,7 @@
 #include "BasicPitchConstants.h"
 #include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
                                // OneBitPitchDetector.h, McLeodPitchDetector.h
+#include "SwiftF0Detector.h"
 
 // ── tune-only constants ────────────────────────────────────────────────────────
 
@@ -148,6 +149,10 @@ struct Monitor {
     // Used for cross-range harmonic suppression.
     std::array<int, 8> onsetProvNotes = {-1,-1,-1,-1,-1,-1,-1,-1};
 
+    std::unique_ptr<SwiftF0Detector> swiftF0;         // null if model not found
+    float                            swiftF0Threshold = 0.5f;
+    std::vector<float>               sf0Buf;          // worker-thread scratch: 16 kHz audio
+
     // Single worker thread shared across all ranges
     std::thread       workerThread;
     std::atomic<bool> workerQuit{false};
@@ -223,21 +228,17 @@ static void runWorker(Monitor* m)
         sem_wait(&m->workerSem);
         if (m->workerQuit.load(std::memory_order_acquire)) break;
 
-        const bool mono = (m->mode == PlayMode::MONO);
+        const bool swiftMono = (m->mode == PlayMode::SWIFT_MONO && m->swiftF0 != nullptr);
+        const bool mono      = (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO);
 
         for (int ri = 0; ri < static_cast<int>(m->ranges.size()); ++ri) {
             RangeState& r = *m->ranges[ri];
             if (!r.snapChan.ready.load(std::memory_order_acquire)) continue;
 
+            // Always update BasicPitch params (no-op in swiftmono but keeps state clean).
             const float minDurMs = r.cfg.minNoteLength * FFT_HOP
                                    / static_cast<float>(PLUGIN_SR) * 1000.0f;
             r.basicPitch->setParameters(1.0f - m->frameThreshold, m->threshold, minDurMs);
-
-            const auto t0 = std::chrono::steady_clock::now();
-            r.basicPitch->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
-            r.snapChan.ready.store(false, std::memory_order_release);
-            const double inferMs = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count();
 
             // Two-phase: insert provisional into activeNotes before diff.
             // Staleness check: if a new provisional has fired since this snapshot
@@ -261,12 +262,63 @@ static void runWorker(Monitor* m)
                 // If stale: leave provNote intact; provForDiff stays -1.
             }
 
-            const uint64_t prevActive = r.activeNotes;
             uint64_t newBits = 0;
             int8_t   newVel[NOTE_COUNT] = {};
-            buildNNBits(r, m->ampFloor, newBits, newVel);
+            double   inferMs = 0.0;
 
-            // Cancel grace: first CNN cycle after a new provisional fires often
+            if (swiftMono) {
+                // SwiftF0 path: resample snapshot 22050→16000 Hz, run inference.
+                const float* src    = r.snapChan.data.data();
+                const int    srcLen = r.snapChan.snapshotSize;
+                constexpr double SF0_SR = 16000.0;
+                const double ratio  = SF0_SR / PLUGIN_SR;
+                const int    dstLen = static_cast<int>(srcLen * ratio);
+                m->sf0Buf.resize(dstLen);
+                for (int i = 0; i < dstLen; ++i) {
+                    const double pos = i / ratio;
+                    const int    s0  = static_cast<int>(pos);
+                    const double f   = pos - s0;
+                    const int    s1  = std::min(s0 + 1, srcLen - 1);
+                    m->sf0Buf[i]     = static_cast<float>((1.0 - f) * src[s0] + f * src[s1]);
+                }
+                r.snapChan.ready.store(false, std::memory_order_release);
+
+                const auto t0 = std::chrono::steady_clock::now();
+                const int midiNote = m->swiftF0->infer(
+                    m->sf0Buf.data(), dstLen, m->swiftF0Threshold);
+                inferMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - m->startTime).count();
+                if (midiNote >= r.cfg.midiLow && midiNote <= r.cfg.midiHigh &&
+                    midiNote >= NOTE_BASE && midiNote < NOTE_BASE + NOTE_COUNT) {
+                    std::printf("[+%.3fs]  --   SwiftF0 → %-4s (%3d)"
+                                "  [inf %4.0fms  range %s]\n",
+                                elapsed, midiToName(midiNote).c_str(), midiNote,
+                                inferMs, r.cfg.name.c_str());
+                    const int bit = midiNote - NOTE_BASE;
+                    newBits    = 1ULL << bit;
+                    newVel[bit] = 100;
+                } else {
+                    std::printf("[+%.3fs]  --   SwiftF0 → silent"
+                                "  [inf %4.0fms  range %s]\n",
+                                elapsed, inferMs, r.cfg.name.c_str());
+                }
+                std::fflush(stdout);
+            } else {
+                // BasicPitch (CNN) path.
+                const auto t0 = std::chrono::steady_clock::now();
+                r.basicPitch->transcribeToMIDI(r.snapChan.data.data(), r.snapChan.snapshotSize);
+                r.snapChan.ready.store(false, std::memory_order_release);
+                inferMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                buildNNBits(r, m->ampFloor, newBits, newVel);
+            }
+
+            const uint64_t prevActive = r.activeNotes;
+
+            // Cancel grace: first inference cycle after a new provisional fires often
             // contains mostly the previous note's audio.  Suppress that cancel so
             // the next cycle (with a full window of the new note) decides instead.
             if (provForDiff != -1 && provForDiff != r.provLastSeenByCNN) {
@@ -280,13 +332,34 @@ static void runWorker(Monitor* m)
                     newBits    |= (1ULL << bit);  // suppress cancel; note already playing
                     newVel[bit] = 64;             // velocity unused (no new note-ON fired)
                 } else {
-                    r.provCancelGrace = 0;  // CNN confirmed naturally
+                    r.provCancelGrace = 0;  // confirmed naturally
                 }
             }
 
-            applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff, mono);
+            if (swiftMono) {
+                // SwiftF0 path: call state machine directly (SwiftF0 log already printed above).
+                applyNotesDiff(r, newBits, newVel, provForDiff, mono);
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - m->startTime).count();
+                for (uint64_t tmp = r.activeNotes & ~prevActive; tmp; tmp &= tmp - 1) {
+                    const int bit = __builtin_ctzll(tmp);
+                    const int p   = NOTE_BASE + bit;
+                    std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d"
+                                "  [SwiftF0  win %4.0fms  inf %4.0fms  range %s]\n",
+                                elapsed, midiToName(p).c_str(), p, newVel[bit],
+                                r.cfg.windowMs, inferMs, r.cfg.name.c_str());
+                }
+                for (uint64_t tmp = prevActive & ~r.activeNotes; tmp; tmp &= tmp - 1) {
+                    const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+                    std::printf("[+%.3fs]  OFF  %-4s (%3d)\n",
+                                elapsed, midiToName(p).c_str(), p);
+                }
+                std::fflush(stdout);
+            } else {
+                applyRangeDiff(m, r, newBits, newVel, inferMs, provForDiff, mono);
+            }
 
-            // Mono cross-range: new note-ON(s) in this range → kill all other ranges
+            // Mono/SwiftMono cross-range: new note-ON(s) in this range → kill all other ranges
             if (mono && (r.activeNotes & ~prevActive)) {
                 const double elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - m->startTime).count();
@@ -377,8 +450,8 @@ static void processSynth(Monitor* m, float* out, int nFrames)
 
         rp.provOnTimeMs = elapsed * 1000.0;  // ms since startTime
 
-        // Mono: release all currently playing voices before firing new note
-        if (m->mode == PlayMode::MONO) {
+        // Mono/SwiftMono: release all currently playing voices before firing new note
+        if (m->mode == PlayMode::MONO || m->mode == PlayMode::SWIFT_MONO) {
             for (auto& v : m->voices)
                 if (v.state != 0 && v.state != 3)
                     v.state = 3;  // enter release
@@ -408,6 +481,11 @@ static void processSynth(Monitor* m, float* out, int nFrames)
         PendingNote pn;
         while (rp->midiOut.pop(pn)) {
             if (pn.noteOn) {
+                std::printf("[+%.3fs]  >>   %-4s (%3d)  vel %3d"
+                            "  [synth ON   range %s]\n",
+                            elapsed, midiToName(pn.pitch).c_str(),
+                            pn.pitch, pn.velocity, rp->cfg.name.c_str());
+                std::fflush(stdout);
                 int   best      = 0;
                 float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
                 for (int i = 0; i < MAX_VOICES; ++i) {
@@ -417,6 +495,11 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                 }
                 m->voices[best] = { pn.pitch, midiToFreq(pn.pitch), 0.0, pn.velocity / 127.0f, 1, 0.0f };
             } else {
+                std::printf("[+%.3fs]  >>   %-4s (%3d)          "
+                            "  [synth OFF  range %s]\n",
+                            elapsed, midiToName(pn.pitch).c_str(),
+                            pn.pitch, rp->cfg.name.c_str());
+                std::fflush(stdout);
                 for (int i = 0; i < MAX_VOICES; ++i)
                     if (m->voices[i].pitch == pn.pitch && m->voices[i].state != 0)
                         m->voices[i].state = 3;
@@ -601,15 +684,16 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 int main(int argc, char** argv)
 {
     std::string bundlePath, configPath;
-    float    threshold      = -1.0f;  // -1 = not set on CLI, use conf/default
-    float    frameThreshold = -1.0f;
-    float    gateFloor      = -1.0f;
-    float    ampFloor       = -1.0f;
-    float    onsetBlankMs   = -1.0f;
-    int      holdCyclesLow  = 2;
-    float    windowMs       = 150.0f;
-    PlayMode mode           = PlayMode::POLY;
-    bool     modeSet        = false;
+    float    threshold       = -1.0f;  // -1 = not set on CLI, use conf/default
+    float    frameThreshold  = -1.0f;
+    float    gateFloor       = -1.0f;
+    float    ampFloor        = -1.0f;
+    float    onsetBlankMs    = -1.0f;
+    float    swiftThreshold  = -1.0f;
+    int      holdCyclesLow   = 2;
+    float    windowMs        = 150.0f;
+    PlayMode mode            = PlayMode::POLY;
+    bool     modeSet         = false;
     Waveform waveform       = Waveform::SINE;
     float    attackMs       = 10.0f;
     float    releaseMs      = 400.0f;
@@ -623,11 +707,14 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--hold-cycles")     && i+1 < argc) holdCyclesLow  = std::stoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--gate")            && i+1 < argc) gateFloor      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--amp-floor")       && i+1 < argc) ampFloor       = std::stof(argv[++i]);
-        else if (!std::strcmp(argv[i], "--onset-blank")     && i+1 < argc) onsetBlankMs   = std::stof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--onset-blank")     && i+1 < argc) onsetBlankMs  = std::stof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--swift-threshold") && i+1 < argc) swiftThreshold = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--window")          && i+1 < argc) windowMs       = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--mode")            && i+1 < argc) {
             const char* s = argv[++i];
-            mode    = (!std::strcmp(s, "mono")) ? PlayMode::MONO : PlayMode::POLY;
+            if      (!std::strcmp(s, "mono"))      mode = PlayMode::MONO;
+            else if (!std::strcmp(s, "swiftmono")) mode = PlayMode::SWIFT_MONO;
+            else                                   mode = PlayMode::POLY;
             modeSet = true;
         }
         else if (!std::strcmp(argv[i], "--attack")          && i+1 < argc) attackMs       = std::stof(argv[++i]);
@@ -641,9 +728,9 @@ int main(int argc, char** argv)
         } else {
             std::fprintf(stderr,
                 "Usage: %s [--bundle PATH] [--config PATH]\n"
-                "          [--threshold F] [--frame-threshold F] [--mode mono|poly]\n"
-                "          [--hold-cycles N] [--gate F] [--amp-floor F] [--window MS]\n"
-                "          [--onset-blank MS]\n"
+                "          [--threshold F] [--frame-threshold F] [--mode mono|poly|swiftmono]\n"
+                "          [--swift-threshold F] [--hold-cycles N] [--gate F] [--amp-floor F]\n"
+                "          [--window MS] [--onset-blank MS]\n"
                 "          [--waveform sine|saw|square] [--attack MS] [--release MS] [--volume F]\n",
                 argv[0]);
             return 1;
@@ -694,6 +781,7 @@ int main(int argc, char** argv)
     if (threshold      >= 0.0f)  rangeCfg.threshold       = threshold;
     if (frameThreshold >= 0.0f)  rangeCfg.frameThreshold  = frameThreshold;
     if (onsetBlankMs   >= 0.0f)  rangeCfg.onsetBlankMs    = onsetBlankMs;
+    if (swiftThreshold >= 0.0f)  rangeCfg.swiftF0Threshold = swiftThreshold;
     if (modeSet)                 rangeCfg.mode             = mode;
 
     if (rangeCfg.ranges.empty()) {
@@ -714,7 +802,11 @@ int main(int argc, char** argv)
     std::printf("AmpFloor:   %.2f\n", rangeCfg.ampFloor);
     std::printf("Threshold:  %.3f\n", rangeCfg.threshold);
     std::printf("FrameThr:   %.3f\n", rangeCfg.frameThreshold);
-    std::printf("Mode:       %s\n", rangeCfg.mode == PlayMode::MONO ? "mono" : "poly");
+    std::printf("Mode:       %s\n",
+                rangeCfg.mode == PlayMode::MONO       ? "mono" :
+                rangeCfg.mode == PlayMode::SWIFT_MONO ? "swiftmono" : "poly");
+    if (rangeCfg.mode == PlayMode::SWIFT_MONO)
+        std::printf("SwiftThr:   %.2f\n", rangeCfg.swiftF0Threshold);
     std::printf("OnsetBlank: %.0f ms\n", rangeCfg.onsetBlankMs);
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
                 MIN_FRESH_FLOOR / static_cast<float>(PLUGIN_SR) * 1000.0f);
@@ -733,12 +825,39 @@ int main(int argc, char** argv)
     catch (const std::exception& e) { std::fprintf(stderr, "Failed to load models: %s\n", e.what()); return 1; }
 
     Monitor mon;
-    mon.gateFloor      = rangeCfg.gateFloor;
-    mon.ampFloor       = rangeCfg.ampFloor;
-    mon.threshold      = rangeCfg.threshold;
-    mon.frameThreshold = rangeCfg.frameThreshold;
-    mon.onsetBlankMs   = rangeCfg.onsetBlankMs;
-    mon.mode           = rangeCfg.mode;
+    mon.gateFloor       = rangeCfg.gateFloor;
+    mon.ampFloor        = rangeCfg.ampFloor;
+    mon.threshold       = rangeCfg.threshold;
+    mon.frameThreshold  = rangeCfg.frameThreshold;
+    mon.onsetBlankMs    = rangeCfg.onsetBlankMs;
+    mon.swiftF0Threshold = rangeCfg.swiftF0Threshold;
+    mon.mode            = rangeCfg.mode;
+
+    // Try to load SwiftF0 model
+    {
+        std::string sf0Path;
+        // Try next to binary first, then bundle path
+        const std::string probes[] = {
+            selfDir + "swift_f0_model.onnx",
+            bundlePath + (bundlePath.empty() || bundlePath.back() == '/' ? "" : "/") + "swift_f0_model.onnx"
+        };
+        for (const auto& p : probes) {
+            FILE* f = std::fopen(p.c_str(), "rb");
+            if (f) { std::fclose(f); sf0Path = p; break; }
+        }
+        if (!sf0Path.empty()) {
+            try {
+                mon.swiftF0 = std::make_unique<SwiftF0Detector>(sf0Path);
+                std::printf("SwiftF0:    loaded from %s\n", sf0Path.c_str());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "Warning: SwiftF0 model load failed (%s) — "
+                             "swiftmono will fall back to BasicPitch\n", e.what());
+            }
+        } else if (rangeCfg.mode == PlayMode::SWIFT_MONO) {
+            std::fprintf(stderr, "Warning: swift_f0_model.onnx not found — "
+                         "swiftmono will fall back to BasicPitch\n");
+        }
+    }
     mon.waveform  = waveform;
     mon.attackMs  = attackMs;
     mon.releaseMs = releaseMs;

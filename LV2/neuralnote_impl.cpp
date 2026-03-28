@@ -56,6 +56,7 @@
 #include "BasicPitchConstants.h"
 #include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
                                // OneBitPitchDetector.h, McLeodPitchDetector.h (if MPM)
+#include "SwiftF0Detector.h"
 
 #define PLUGIN_URI "https://github.com/DamRsn/NeuralNote/guitar2midi"
 
@@ -127,8 +128,10 @@ struct NeuralNotePlugin {
     std::atomic<float> thresholdVal{0.6f};
     std::atomic<float> frameThresholdVal{0.5f};
     std::atomic<float> ampFloorVal{0.65f};
-    std::atomic<int>   modeVal{1};  // 0 = poly, 1 = mono  (default: mono)
+    std::atomic<int>   modeVal{1};  // 0 = poly, 1 = mono, 2 = swiftmono (default: mono)
 
+    std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
+    std::vector<float>               sf0Buf;   // worker-thread scratch: 16 kHz resampled audio
 
     std::vector<std::unique_ptr<RangeState>> ranges;
     bool singleRangeMode = true;
@@ -153,8 +156,10 @@ static void runWorker(NeuralNotePlugin* self)
         sem_wait(&self->workerSem);
         if (self->workerQuit.load(std::memory_order_acquire)) break;
 
-        const float ampFloor = self->ampFloorVal.load(std::memory_order_relaxed);
-        const bool  mono     = (self->modeVal.load(std::memory_order_relaxed) == 1);
+        const float ampFloor  = self->ampFloorVal.load(std::memory_order_relaxed);
+        const int   modeNow   = self->modeVal.load(std::memory_order_relaxed);
+        const bool  swiftMono = (modeNow == 2 && self->swiftF0 != nullptr);
+        const bool  mono      = (modeNow >= 1);
 
         for (int ri = 0; ri < static_cast<int>(self->ranges.size()); ++ri) {
             RangeState& r = *self->ranges[ri];
@@ -168,11 +173,6 @@ static void runWorker(NeuralNotePlugin* self)
             }
 
             if (hasSnap) {
-                r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
-                                                r.snapChan.snapshotSize);
-                r.snapChan.ready.store(false, std::memory_order_release);
-                hasPriorResult[ri] = true;
-
                 // Two-phase: insert provisional before diff.
                 // Staleness check: if a new provisional has fired since this snapshot
                 // was dispatched, the CNN result doesn't correspond to the current
@@ -200,7 +200,40 @@ static void runWorker(NeuralNotePlugin* self)
                 const uint64_t prevActive = r.activeNotes;
                 uint64_t newBits = 0;
                 int8_t   newVel[NOTE_COUNT] = {};
-                buildNNBits(r, ampFloor, newBits, newVel);
+
+                if (swiftMono) {
+                    // SwiftF0 path: resample 22050→16000 Hz, run ONNX inference.
+                    const float* src    = r.snapChan.data.data();
+                    const int    srcLen = r.snapChan.snapshotSize;
+                    constexpr double SF0_SR = 16000.0;
+                    const double ratio  = SF0_SR / PLUGIN_SR;
+                    const int    dstLen = static_cast<int>(srcLen * ratio);
+                    self->sf0Buf.resize(dstLen);
+                    for (int i = 0; i < dstLen; ++i) {
+                        const double pos = i / ratio;
+                        const int    s0  = static_cast<int>(pos);
+                        const double f   = pos - s0;
+                        const int    s1  = std::min(s0 + 1, srcLen - 1);
+                        self->sf0Buf[i]  = static_cast<float>((1.0 - f) * src[s0] + f * src[s1]);
+                    }
+                    r.snapChan.ready.store(false, std::memory_order_release);
+
+                    const int midiNote = self->swiftF0->infer(
+                        self->sf0Buf.data(), dstLen, 0.5f);
+
+                    if (midiNote >= r.cfg.midiLow && midiNote <= r.cfg.midiHigh &&
+                        midiNote >= NOTE_BASE && midiNote < NOTE_BASE + NOTE_COUNT) {
+                        const int bit = midiNote - NOTE_BASE;
+                        newBits    = 1ULL << bit;
+                        newVel[bit] = 100;
+                    }
+                } else {
+                    r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
+                                                    r.snapChan.snapshotSize);
+                    r.snapChan.ready.store(false, std::memory_order_release);
+                    hasPriorResult[ri] = true;
+                    buildNNBits(r, ampFloor, newBits, newVel);
+                }
 
                 // Cancel grace: first CNN cycle after a new provisional fires often
                 // contains mostly the previous note's audio.  Suppress that cancel so
@@ -316,6 +349,23 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         lv2_log_error(&self->logger, "NeuralNote: %s\n", e.what());
         delete self;
         return nullptr;
+    }
+
+    // Try to load SwiftF0 model from bundle (optional — swiftmono mode degrades to
+    // basicpitch if the file is absent).
+    {
+        std::string sf0Path = std::string(bundlePath);
+        if (!sf0Path.empty() && sf0Path.back() != '/') sf0Path += '/';
+        sf0Path += "swift_f0_model.onnx";
+        try {
+            self->swiftF0 = std::make_unique<SwiftF0Detector>(sf0Path);
+            lv2_log_note(&self->logger, "NeuralNote: SwiftF0 model loaded from %s\n",
+                         sf0Path.c_str());
+        } catch (const std::exception& e) {
+            lv2_log_note(&self->logger,
+                         "NeuralNote: SwiftF0 model not loaded (%s) — swiftmono will use BasicPitch\n",
+                         e.what());
+        }
     }
 
     std::string cfgPath = std::string(bundlePath);
@@ -495,8 +545,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                                   0x80, static_cast<uint8_t>(note), uint8_t(0));
                 }
-                // Mono: kill any other range's held note
-                if (self->modeVal.load(std::memory_order_relaxed) == 1) {
+                // Mono / SwiftMono: kill any other range's held note
+                if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
                     for (auto& other : self->ranges) {
                         const int held = other->monoHeldNote.load(std::memory_order_acquire);
                         if (held != -1 && held != note) {
