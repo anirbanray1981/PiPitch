@@ -260,13 +260,13 @@ DEFINES="-DNEURALNOTE_IMPL_NAME=\"neuralnote_impl_armv82\" \
   -DRTNEURAL_DEFAULT_ALIGNMENT=16 -DRTNEURAL_NAMESPACE=RTNeural \
   -DRTNEURAL_USE_EIGEN=1 -DSAVE_DOWNSAMPLED_AUDIO=0 \
   -DUSE_TEST_NOTE_FRAME_TO_TIME=0 -Dneuralnote_impl_armv82_EXPORTS"
-INCLUDES="-I/root/neuralnote_src/LV2 -I/root/neuralnote_src/Lib/Model \
-  -I/root/neuralnote_src/Lib/Utils \
-  -I/root/neuralnote_src/ThirdParty/RTNeural \
-  -I/root/neuralnote_src/ThirdParty/onnxruntime/include \
-  -I/root/neuralnote_src/ThirdParty/RTNeural/RTNeural/../modules/json \
-  -I/root/neuralnote_src/ThirdParty/RTNeural/RTNeural/.. \
-  -I/root/neuralnote_src/ThirdParty/RTNeural/modules/Eigen"
+INCLUDES="-I/root/neuralnote_src/LV2 -I/root/neuralnote_src/NeuralNote/Lib/Model \
+  -I/root/neuralnote_src/NeuralNote/Lib/Utils \
+  -I/root/neuralnote_src/NeuralNote/ThirdParty/RTNeural \
+  -I/root/neuralnote_src/NeuralNote/ThirdParty/onnxruntime/include \
+  -I/root/neuralnote_src/NeuralNote/ThirdParty/RTNeural/RTNeural/../modules/json \
+  -I/root/neuralnote_src/NeuralNote/ThirdParty/RTNeural/RTNeural/.. \
+  -I/root/neuralnote_src/NeuralNote/ThirdParty/RTNeural/modules/Eigen"
 
 # Rebuild impl
 /usr/bin/c++ $DEFINES $INCLUDES \
