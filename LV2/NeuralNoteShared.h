@@ -23,6 +23,8 @@
 #include <semaphore.h>
 #include <vector>
 
+#include "MidiNotes.h"
+
 // BinaryData.h must precede any Lib/Model header.
 #include "BinaryData.h"
 #include "BasicPitch.h"
@@ -40,8 +42,8 @@ static constexpr double PLUGIN_SR = 22050.0;
 // ── Guitar MIDI range ─────────────────────────────────────────────────────────
 // E2 (MIDI 40) … E6 (MIDI 88) — 49 notes, fits in one uint64_t bitmap.
 
-static constexpr int NOTE_BASE  = 40;
-static constexpr int NOTE_COUNT = 49;
+static constexpr int NOTE_BASE  = MIDI_NOTE_E2;
+static constexpr int NOTE_COUNT = MIDI_NOTE_E6 - MIDI_NOTE_E2 + 1;  // 49
 
 static inline void bmSet  (uint64_t& b, int midi) noexcept { b |=  (1ULL << (midi - NOTE_BASE)); }
 static inline void bmClear(uint64_t& b, int midi) noexcept { b &= ~(1ULL << (midi - NOTE_BASE)); }
@@ -54,6 +56,7 @@ static constexpr int MIN_FRESH_FLOOR = static_cast<int>(PLUGIN_SR * 0.025); // ~
 
 // ── Onset detection ───────────────────────────────────────────────────────────
 
+static constexpr int   SWIFT_POLY_KEEPALIVE = 2; // cycles to keep SwiftF0 note alive awaiting BasicPitch
 static constexpr float ONSET_RATIO    = 3.0f;   // RMS must exceed background × this
 static constexpr float ONSET_ALPHA    = 0.05f;  // background tracker time constant
 static constexpr float ONSET_BLANK_MS = 25.0f;  // re-trigger suppression window
@@ -251,6 +254,12 @@ struct RangeStateBase {
     int                 swiftPendingNote   = -1;   // note awaiting confirmation (-1 = none)
     int                 swiftPendingAge    = 0;    // cycles since pending was set
 
+    // Worker-only: SwiftPoly keep-alive — bridge between SwiftF0 firing a note-ON
+    // and BasicPitch confirming it (~95ms later).  Notes in this bitmap survive in
+    // the merged bitmap even if BasicPitch hasn't seen them yet.
+    uint64_t            swiftPolyKeepBits  = 0;
+    alignas(8) int8_t   swiftPolyKeepAge[NOTE_COUNT] = {};
+
     // Audio→worker: deferred provisional during note transitions.
     // Set by fireProv when a different note is already active (transition mode).
     // The worker uses this for consensus: SwiftF0 && transitionProv must agree.
@@ -378,7 +387,7 @@ static int runOBPHPS(RangeT& r,
                      const RangesContainer& allRanges) noexcept
 {
     static constexpr int OBP_CHUNK    = 16;
-    static constexpr int OBP_NOTE_CAP = 76;  // E5 — reject OBP provisionals above this
+    static constexpr int OBP_NOTE_CAP = MIDI_NOTE_E5;  // reject OBP provisionals above this
 
     const float* obpPtr = audioIn;
     int          obpRem = nSamples;

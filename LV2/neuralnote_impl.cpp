@@ -128,7 +128,7 @@ struct NeuralNotePlugin {
     std::atomic<float> thresholdVal{0.6f};
     std::atomic<float> frameThresholdVal{0.5f};
     std::atomic<float> ampFloorVal{0.65f};
-    std::atomic<int>   modeVal{1};  // 0 = poly, 1 = mono, 2 = swiftmono (default: mono)
+    std::atomic<int>   modeVal{1};  // 0=poly, 1=mono, 2=swiftmono, 3=swiftpoly (default: mono)
 
     std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
     std::vector<float>               sf0Buf;   // worker-thread scratch: 16 kHz resampled audio
@@ -167,7 +167,8 @@ static void runWorker(NeuralNotePlugin* self)
         const float ampFloor  = self->ampFloorVal.load(std::memory_order_relaxed);
         const int   modeNow   = self->modeVal.load(std::memory_order_relaxed);
         const bool  swiftMono = (modeNow == 2 && self->swiftF0 != nullptr);
-        const bool  mono      = (modeNow >= 1);
+        const bool  swiftPoly = (modeNow == 3 && self->swiftF0 != nullptr);
+        const bool  mono      = (modeNow == 1 || modeNow == 2);
 
         for (int ri = 0; ri < static_cast<int>(self->ranges.size()); ++ri) {
             RangeState& r = *self->ranges[ri];
@@ -192,17 +193,24 @@ static void runWorker(NeuralNotePlugin* self)
                 if (prov != -1) {
                     const int currentProv = r.provNote.load(std::memory_order_acquire);
                     if (currentProv == prov) {
-                        // CNN result matches current provisional — normal two-phase path
                         r.provNote.store(-1, std::memory_order_release);
                         if (prov >= NOTE_BASE && prov < NOTE_BASE + NOTE_COUNT) {
-                            r.activeNotes |= (1ULL << (prov - NOTE_BASE));
-                            provForDiff = prov;
+                            if (swiftPoly) {
+                                // SwiftPoly: route to keep-alive AND activeNotes.
+                                // activeNotes prevents applyNotesDiff double-ON since
+                                // processSynth already sent MIDI ON from audio thread.
+                                const int bit = prov - NOTE_BASE;
+                                r.swiftPolyKeepBits  |= (1ULL << bit);
+                                r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
+                                r.activeNotes |= (1ULL << bit);
+                            } else {
+                                r.activeNotes |= (1ULL << (prov - NOTE_BASE));
+                                provForDiff = prov;
+                            }
                         } else {
                             r.midiOut.push({false, prov, 0});
                         }
                     }
-                    // If stale (currentProv != prov): a new provisional has fired.
-                    // Leave provNote intact; pass provForDiff = -1 to avoid cancelling it.
                 }
 
                 const uint64_t prevActive = r.activeNotes;
@@ -313,6 +321,153 @@ static void runWorker(NeuralNotePlugin* self)
                             r.swiftPendingAge  = 0;
                         }
                     }
+                } else if (swiftPoly) {
+                    // SwiftPoly: SwiftF0 for note-ON, BasicPitch for sustain/OFF.
+                    // Run SwiftF0 first (fast), then BasicPitch (slow).
+
+                    // --- SwiftF0 inference (~5ms) ---
+                    const float* src    = r.snapChan.data.data();
+                    const int    srcLen = r.snapChan.snapshotSize;
+                    const bool   wasOnset = r.snapChan.onsetDispatched;
+                    constexpr double SF0_SR = 16000.0;
+                    const double ratio  = SF0_SR / PLUGIN_SR;
+                    const int    dstLen = static_cast<int>(srcLen * ratio);
+                    self->sf0Buf.resize(dstLen);
+                    for (int i = 0; i < dstLen; ++i) {
+                        const double pos = i / ratio;
+                        const int    s0  = static_cast<int>(pos);
+                        const double f   = pos - s0;
+                        const int    s1  = std::min(s0 + 1, srcLen - 1);
+                        self->sf0Buf[i]  = static_cast<float>((1.0 - f) * src[s0] + f * src[s1]);
+                    }
+
+                    const int swiftNote = self->swiftF0->infer(
+                        self->sf0Buf.data(), dstLen, 0.5f);
+
+                    uint64_t swiftBits = 0;
+                    if (swiftNote >= r.cfg.midiLow && swiftNote <= r.cfg.midiHigh &&
+                        swiftNote >= NOTE_BASE && swiftNote < NOTE_BASE + NOTE_COUNT) {
+                        swiftBits = 1ULL << (swiftNote - NOTE_BASE);
+                    }
+
+                    // --- BasicPitch inference (~95ms) ---
+                    r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
+                                                    r.snapChan.snapshotSize);
+                    r.snapChan.ready.store(false, std::memory_order_release);
+                    hasPriorResult[ri] = true;
+
+                    uint64_t cnnBits = 0;
+                    int8_t   cnnVel[NOTE_COUNT] = {};
+                    buildNNBits(r, ampFloor, cnnBits, cnnVel);
+
+                    // --- SwiftF0 grace/suppression (same as swiftmono) ---
+                    // From-silence onset grace
+                    if (wasOnset && r.swiftOnsetGrace <= 0) {
+                        r.swiftOnsetGrace = 2;
+                        r.swiftGraceStaleNote = -1;
+                    }
+                    if (r.swiftOnsetGrace > 0) {
+                        if (!r.activeNotes && swiftBits) {
+                            const int detected = NOTE_BASE + __builtin_ctzll(swiftBits);
+                            const int tp = r.transitionProv.load(std::memory_order_acquire);
+                            if (detected != tp) {
+                                if (r.swiftGraceStaleNote < 0) {
+                                    r.swiftGraceStaleNote = detected;
+                                    swiftBits = 0;
+                                } else if (detected == r.swiftGraceStaleNote) {
+                                    swiftBits = 0;
+                                }
+                            }
+                        }
+                        --r.swiftOnsetGrace;
+                    }
+
+                    // Decay-tail ghost suppression
+                    if (swiftBits & ~r.activeNotes) {
+                        const uint64_t elapsed =
+                            self->totalSamples.load(std::memory_order_relaxed)
+                            - self->lastOnsetSample.load(std::memory_order_acquire);
+                        constexpr double ONSET_GATE_S = 0.25;
+                        const auto gate = static_cast<uint64_t>(self->sampleRate * ONSET_GATE_S);
+                        if (elapsed > gate)
+                            swiftBits = 0;
+                    }
+
+                    // Note-change confirmation / consensus
+                    {
+                        const uint64_t playing = r.activeNotes | r.holdNotes;
+                        if (swiftBits && playing && swiftBits != r.activeNotes) {
+                            const int detected = NOTE_BASE + __builtin_ctzll(swiftBits);
+                            const int tp = r.transitionProv.load(std::memory_order_acquire);
+                            if (detected == tp) {
+                                r.transitionProv.store(-1, std::memory_order_release);
+                                r.swiftPendingNote = -1;
+                                r.swiftPendingAge  = 0;
+                            } else if (detected == r.swiftPendingNote) {
+                                r.swiftPendingNote = -1;
+                                r.swiftPendingAge  = 0;
+                            } else if (r.swiftPendingAge < 3) {
+                                r.swiftPendingNote = detected;
+                                ++r.swiftPendingAge;
+                                swiftBits = r.activeNotes;
+                            } else {
+                                r.swiftPendingNote = -1;
+                                r.swiftPendingAge  = 0;
+                            }
+                        } else {
+                            r.swiftPendingNote = -1;
+                            r.swiftPendingAge  = 0;
+                        }
+                    }
+
+                    // --- Merge: SwiftF0 note-ONs + BasicPitch sustain/OFF ---
+                    // New notes from SwiftF0 → add to keep-alive
+                    const uint64_t swiftNew = swiftBits & ~r.activeNotes;
+                    for (uint64_t tmp = swiftNew; tmp; tmp &= tmp - 1) {
+                        const int bit = __builtin_ctzll(tmp);
+                        r.swiftPolyKeepBits  |= (1ULL << bit);
+                        r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
+                        cnnVel[bit] = 100;  // ensure velocity for new note
+                    }
+
+                    // Merge: start with cnnBits, add keep-alive notes, tick ages
+                    newBits = cnnBits;
+                    std::memcpy(newVel, cnnVel, NOTE_COUNT);
+                    for (uint64_t tmp = r.swiftPolyKeepBits; tmp; tmp &= tmp - 1) {
+                        const int bit = __builtin_ctzll(tmp);
+                        if (cnnBits & (1ULL << bit)) {
+                            // BasicPitch confirmed — remove from keep-alive
+                            r.swiftPolyKeepBits  &= ~(1ULL << bit);
+                            r.swiftPolyKeepAge[bit] = 0;
+                        } else if (--r.swiftPolyKeepAge[bit] <= 0) {
+                            // Keep-alive expired — BasicPitch never confirmed → immediate OFF
+                            r.swiftPolyKeepBits  &= ~(1ULL << bit);
+                            r.swiftPolyKeepAge[bit] = 0;
+                            r.midiOut.push({false, NOTE_BASE + bit, 0});
+                            r.activeNotes &= ~(1ULL << bit);
+                            r.holdNotes   &= ~(1ULL << bit);
+                        } else {
+                            // Still alive — inject into merged bitmap
+                            newBits |= (1ULL << bit);
+                            if (!newVel[bit]) newVel[bit] = 100;
+                        }
+                    }
+
+                    // Active cancellation: if BasicPitch has notes, cancel any
+                    // keep-alive notes it disagrees with — BasicPitch is the authority.
+                    if (cnnBits && r.swiftPolyKeepBits) {
+                        const uint64_t mismatch = r.swiftPolyKeepBits & ~cnnBits;
+                        newBits &= ~mismatch;
+                        for (uint64_t tmp = mismatch; tmp; tmp &= tmp - 1) {
+                            const int bit = __builtin_ctzll(tmp);
+                            r.swiftPolyKeepAge[bit] = 0;
+                            r.midiOut.push({false, NOTE_BASE + bit, 0});
+                            r.activeNotes &= ~(1ULL << bit);
+                            r.holdNotes   &= ~(1ULL << bit);
+                        }
+                        r.swiftPolyKeepBits &= ~mismatch;
+                    }
+
                 } else {
                     r.basicPitch->transcribeToMIDI(r.snapChan.data.data(),
                                                     r.snapChan.snapshotSize);
@@ -680,7 +835,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 // High-note harmonic suppression: when a note >= E5 is active in
                 // another range, this provisional is likely a sympathetic harmonic.
                 if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
-                    constexpr uint64_t highMask = ~((1ULL << (76 - NOTE_BASE)) - 1);
+                    constexpr uint64_t highMask = ~((1ULL << (MIDI_NOTE_E5 - NOTE_BASE)) - 1);
                     for (auto& other : self->ranges) {
                         if (&*other == &r) continue;
                         if (other->activeNotesBits.load(std::memory_order_acquire) & highMask)
@@ -706,8 +861,9 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         return;
                     }
                 }
-                // Mono / SwiftMono: kill any other range's held note
-                if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
+                // Mono / SwiftMono: kill any other range's held note (NOT swiftpoly)
+                {   const int mv = self->modeVal.load(std::memory_order_relaxed);
+                if (mv == 1 || mv == 2) {
                     for (auto& other : self->ranges) {
                         const int held = other->monoHeldNote.load(std::memory_order_acquire);
                         if (held != -1 && held != note) {
@@ -716,7 +872,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                             other->monoHeldNote.store(-1, std::memory_order_release);
                         }
                     }
-                }
+                }}
                 writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                           0x90, static_cast<uint8_t>(note), uint8_t(100));
                 r.provNote.store(note, std::memory_order_release);
@@ -745,7 +901,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                             static_cast<float>(self->sampleRate),
                             r.cfg.midiLow, r.cfg.midiHigh);
                         if (mpmNote != -1) {
-                            const bool mono = (self->modeVal.load(std::memory_order_relaxed) >= 1);
+                            const int mv2 = self->modeVal.load(std::memory_order_relaxed);
+                            const bool mono = (mv2 == 1 || mv2 == 2);
                             bool suppress = false;
                             if (mono) {
                                 for (auto& orp : self->ranges) {
