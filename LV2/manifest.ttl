@@ -3,5 +3,5 @@
 
 <https://github.com/anirbanray1981/PiPitch>
     a lv2:Plugin ;
-    lv2:binary <neuralnote_guitar2midi.so> ;
+    lv2:binary <pipitch.so> ;
     rdfs:seeAlso <plugin.ttl> .

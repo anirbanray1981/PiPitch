@@ -2,7 +2,7 @@
  * PiPitch — LV2 Implementation (low-latency streaming)
  *
  * Compiled multiple times with different -march flags by CMake.
- * Loaded by neuralnote_guitar2midi.so (the wrapper) via dlopen().
+ * Loaded by pipitch.so (the wrapper) via dlopen().
  *
  * Threading model
  * ───────────────
@@ -20,7 +20,7 @@
  *
  * Per-range configuration
  * ───────────────────────
- * If neuralnote_ranges.conf exists in the bundle directory each [range] section
+ * If pipitch_ranges.conf exists in the bundle directory each [range] section
  * defines a separate MIDI range.  Without it, single-range mode uses LV2 ports.
  */
 
@@ -46,26 +46,26 @@
 #include <vector>
 
 // McLeod Pitch Method: only on ARMv8.2-A (Pi 5, Cortex-A76).
-// Must be defined before NeuralNoteShared.h so that RangeStateBase and all
+// Must be defined before PiPitchShared.h so that RangeStateBase and all
 // shared pipeline functions compile in the McLeod call-sites.
 // The neon (Pi 4) build leaves this undefined — no FFTW dependency.
 #if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
-#  define NEURALNOTE_ENABLE_MPM 1
+#  define PIPITCH_ENABLE_MPM 1
 #endif
 
 #include "BasicPitchConstants.h"
-#include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
+#include "PiPitchShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
                                // OneBitPitchDetector.h, McLeodPitchDetector.h (if MPM)
 #include "SwiftF0Detector.h"
 
 #define PLUGIN_URI "https://github.com/anirbanray1981/PiPitch"
 
-#ifndef NEURALNOTE_IMPL_NAME
-#define NEURALNOTE_IMPL_NAME "neuralnote_impl"
+#ifndef PIPITCH_IMPL_NAME
+#define PIPITCH_IMPL_NAME "neuralnote_impl"
 #endif
 
-#define NEURALNOTE_STRINGIFY2(x) #x
-#define NEURALNOTE_STRINGIFY(x)  NEURALNOTE_STRINGIFY2(x)
+#define PIPITCH_STRINGIFY2(x) #x
+#define PIPITCH_STRINGIFY(x)  PIPITCH_STRINGIFY2(x)
 
 // ── Port indices ──────────────────────────────────────────────────────────────
 
@@ -98,7 +98,7 @@ static void mapURIs(LV2_URID_Map* map, URIs* uris)
 }
 
 // Forward declaration
-struct NeuralNotePlugin;
+struct PiPitchPlugin;
 
 // ── Per-range runtime state ───────────────────────────────────────────────────
 // All common fields (including MidiOutQueue midiOut) live in RangeStateBase.
@@ -108,7 +108,7 @@ struct RangeState : RangeStateBase {
 
 // ── Plugin instance ───────────────────────────────────────────────────────────
 
-struct NeuralNotePlugin {
+struct PiPitchPlugin {
     LV2_URID_Map*   map;
     LV2_Log_Logger  logger;
     LV2_Atom_Forge  forge;
@@ -160,7 +160,7 @@ struct NeuralNotePlugin {
 // ── Worker thread hooks (LV2 plugin) ──────────────────────────────────────────
 
 struct ImplWorkerHooks {
-    NeuralNotePlugin* self;
+    PiPitchPlugin* self;
 
     sem_t&              workerSem()      { return self->workerSem; }
     bool                shouldQuit()     { return self->workerQuit.load(std::memory_order_acquire); }
@@ -188,7 +188,7 @@ struct ImplWorkerHooks {
 
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
-static void runWorker(NeuralNotePlugin* self)
+static void runWorker(PiPitchPlugin* self)
 {
     ImplWorkerHooks hooks{self};
     runWorkerCommon(hooks);
@@ -240,7 +240,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
                                 const char*           bundlePath,
                                 const LV2_Feature* const* features)
 {
-    NeuralNotePlugin* self = new NeuralNotePlugin();
+    PiPitchPlugin* self = new PiPitchPlugin();
     self->sampleRate = rate;
     self->map        = nullptr;
 
@@ -282,7 +282,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
 
     std::string cfgPath = std::string(bundlePath);
     if (!cfgPath.empty() && cfgPath.back() != '/') cfgPath += '/';
-    cfgPath += "neuralnote_ranges.conf";
+    cfgPath += "pipitch_ranges.conf";
     RangeConfig rangeCfg = loadRangeConfig(cfgPath);
 
     auto makeRange = [&](const NoteRange& cfg) {
@@ -300,7 +300,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         const float cutoff = std::min(440.0f * std::pow(2.0f, (cfg.midiHigh - 69) / 12.0f) * 1.2f,
                                       sr * 0.45f);
         r->obd.setLowpass(cutoff, sr);
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
         r->mpm.init(sr, cfg.midiLow, cfg.midiHigh);
 #endif
         return r;
@@ -329,14 +329,14 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     self->workerThread = std::thread(runWorker, self);
 
     lv2_log_note(&self->logger,
-                 "PiPitch: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
+                 "PiPitch: %.0f Hz  [impl: " PIPITCH_IMPL_NAME
                  "]  [ranges: %zu, single worker thread]\n", rate, self->ranges.size());
     return static_cast<LV2_Handle>(self);
 }
 
 static void connectPort(LV2_Handle instance, uint32_t port, void* data)
 {
-    NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
+    PiPitchPlugin* self = static_cast<PiPitchPlugin*>(instance);
     switch (static_cast<PortIndex>(port)) {
         case PORT_AUDIO_IN:        self->audioIn            = static_cast<const float*>(data);       break;
         case PORT_MIDI_OUT:        self->midiOut            = static_cast<LV2_Atom_Sequence*>(data); break;
@@ -353,7 +353,7 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
 
 static void activate(LV2_Handle instance)
 {
-    NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
+    PiPitchPlugin* self = static_cast<PiPitchPlugin*>(instance);
     for (auto& rp : self->ranges) {
         rp->ringHead     = 0;
         rp->ringFilled   = 0;
@@ -362,7 +362,7 @@ static void activate(LV2_Handle instance)
         rp->basicPitch->reset();
         rp->obd.reset();
         rp->obdVoting.reset();
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
         rp->mpm.reset();
 #endif
         rp->obdOnsetActive     = false;
@@ -384,7 +384,7 @@ static void activate(LV2_Handle instance)
 
 static void run(LV2_Handle instance, uint32_t nSamples)
 {
-    NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
+    PiPitchPlugin* self = static_cast<PiPitchPlugin*>(instance);
 
     lv2_atom_forge_set_buffer(&self->forge,
                                reinterpret_cast<uint8_t*>(self->midiOut),
@@ -551,7 +551,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 r.provCooldownNote   = note;
             };
 
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
             // Push to MPM while OBP window is active OR while awaiting MPM on a
             // pending OBP vote — so we can retry analyze() next callback.
             if (r.obdOnsetActive || r.obdPendingNote != -1)
@@ -566,7 +566,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                                                     self->ranges);
                     // MPM fallback: OBP expired with no vote — try MPM alone
                     if (finalNote == -1 && !r.obdOnsetActive) {
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
                         const int mpmNote = r.mpm.analyze(
                             static_cast<float>(self->sampleRate),
                             r.cfg.midiLow, r.cfg.midiHigh);
@@ -588,7 +588,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                     }
                     if (finalNote != -1) {
                         bool shouldFire = false;
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
                         const int mpmNote = r.mpm.analyze(
                             static_cast<float>(self->sampleRate),
                             r.cfg.midiLow, r.cfg.midiHigh);
@@ -612,7 +612,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                     }
                 }
             }
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
             else if (r.obdPendingNote != -1
                      && r.provNote.load(std::memory_order_relaxed) == -1) {
                 // OBP voted previously but MPM wasn't ready — retry now that more
@@ -682,7 +682,7 @@ static void deactivate(LV2_Handle /*instance*/) {}
 
 static void cleanup(LV2_Handle instance)
 {
-    NeuralNotePlugin* self = static_cast<NeuralNotePlugin*>(instance);
+    PiPitchPlugin* self = static_cast<PiPitchPlugin*>(instance);
     self->workerQuit.store(true, std::memory_order_release);
     sem_post(&self->workerSem);
     if (self->workerThread.joinable())
@@ -700,7 +700,7 @@ static const LV2_Descriptor descriptor = {
     run, deactivate, cleanup, extensionData,
 };
 
-LV2_SYMBOL_EXPORT const LV2_Descriptor* neuralnote_impl_descriptor(uint32_t index)
+LV2_SYMBOL_EXPORT const LV2_Descriptor* pipitch_impl_descriptor(uint32_t index)
 {
     return (index == 0) ? &descriptor : nullptr;
 }

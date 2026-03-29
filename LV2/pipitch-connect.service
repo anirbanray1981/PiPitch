@@ -1,11 +1,11 @@
 [Unit]
-Description=NeuralNote MIDI fan-out — connect ZynMidiRouter:ch0_out to extra synth chains
+Description=PiPitch MIDI fan-out — connect ZynMidiRouter:ch0_out to extra synth chains
 After=zynthian.service
 Requires=zynthian.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/neuralnote-connect.sh
+ExecStart=/usr/local/bin/pipitch-connect.sh
 StandardOutput=journal
 StandardError=journal
 RemainAfterExit=no

@@ -3,7 +3,7 @@
  * MidiNotes.h -- Named MIDI note number definitions (C2 to C6).
  *
  * Sharps use an S suffix (e.g., MIDI_NOTE_CS2 for C#2).
- * Included by NeuralNoteShared.h; available wherever the shared header is used.
+ * Included by PiPitchShared.h; available wherever the shared header is used.
  */
 
 // ── Octave 2 (MIDI 36-47) ───────────────────────────────────────────────────

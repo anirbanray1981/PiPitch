@@ -1,10 +1,10 @@
 #!/bin/bash
-# neuralnote-connect.sh — MIDI fan-out for NeuralNote Guitar2MIDI
+# pipitch-connect.sh — MIDI fan-out for PiPitch
 #
-# Connects ZynMidiRouter:ch0_out (NeuralNote's MIDI output channel) to
+# Connects ZynMidiRouter:ch0_out (PiPitch's MIDI output channel) to
 # additional synth chains that Zynthian does not automatically route there.
 #
-# Runs at boot via neuralnote-connect.service (After=zynthian.service).
+# Runs at boot via pipitch-connect.service (After=zynthian.service).
 # Edit the EXTRA_DSTS array to match your Zynthian synth chain layout.
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -29,7 +29,7 @@ wait_for_port() {
         sleep "$POLL"
         elapsed=$(( elapsed + POLL ))
     done
-    echo "neuralnote-connect: timeout waiting for port '$port'" >&2
+    echo "pipitch-connect: timeout waiting for port '$port'" >&2
     return 1
 }
 
@@ -40,9 +40,9 @@ connect() {
     # No-op if already connected
     jack_lsp -c "$src" 2>/dev/null | grep -qF "$dst" && return 0
     if jack_connect "$src" "$dst" 2>/dev/null; then
-        echo "neuralnote-connect: connected  $src  ->  $dst"
+        echo "pipitch-connect: connected  $src  ->  $dst"
     else
-        echo "neuralnote-connect: failed to connect  $src  ->  $dst" >&2
+        echo "pipitch-connect: failed to connect  $src  ->  $dst" >&2
     fi
 }
 

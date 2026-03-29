@@ -9,21 +9,21 @@
  *   2. dlopen()s the appropriate pre-compiled implementation .so from the
  *      same bundle directory:
  *        aarch64:
- *          dotprod + fp16 → neuralnote_impl_armv82.so   (Raspberry Pi 5)
- *          NEON only      → neuralnote_impl_neon.so     (Raspberry Pi 4)
+ *          dotprod + fp16 → pipitch_impl_armv82.so   (Raspberry Pi 5)
+ *          NEON only      → pipitch_impl_neon.so     (Raspberry Pi 4)
  *        x86-64:
- *          AVX2 + FMA     → neuralnote_impl_avx2.so
+ *          AVX2 + FMA     → pipitch_impl_avx2.so
  *          SSE4.2         → neuralnote_impl_sse42.so
  *   3. Delegates every LV2 callback to the loaded implementation via
  *      thin trampolines (no overhead after the first instantiate() call).
  *
  * Bundle layout:
- *   neuralnote_guitar2midi.lv2/
- *     neuralnote_guitar2midi.so    ← this file (host entry point)
- *     neuralnote_impl_neon.so      ← Pi 4 / generic aarch64
- *     neuralnote_impl_armv82.so    ← Pi 5 / Cortex-A76
+ *   pipitch.lv2/
+ *     pipitch.so    ← this file (host entry point)
+ *     pipitch_impl_neon.so      ← Pi 4 / generic aarch64
+ *     pipitch_impl_armv82.so    ← Pi 5 / Cortex-A76
  *     neuralnote_impl_sse42.so     ← x86-64 baseline
- *     neuralnote_impl_avx2.so      ← x86-64 modern
+ *     pipitch_impl_avx2.so      ← x86-64 modern
  *     manifest.ttl
  *     plugin.ttl
  *     ModelData/
@@ -55,21 +55,21 @@ static const char* select_impl()
     const bool has_asimd_fp16 = (hwcap & HWCAP_ASIMDHP) != 0;
     // Require both dotprod and fp16: both are part of ARMv8.2-A and present
     // on Cortex-A76 (Pi 5) but absent on Cortex-A72 (Pi 4).
-    return (has_dotprod && has_asimd_fp16) ? "neuralnote_impl_armv82.so"
-                                           : "neuralnote_impl_neon.so";
+    return (has_dotprod && has_asimd_fp16) ? "pipitch_impl_armv82.so"
+                                           : "pipitch_impl_neon.so";
 }
 
 #elif defined(__x86_64__) || defined(_M_X64)
 static const char* select_impl()
 {
-    return __builtin_cpu_supports("avx2") ? "neuralnote_impl_avx2.so"
+    return __builtin_cpu_supports("avx2") ? "pipitch_impl_avx2.so"
                                           : "neuralnote_impl_sse42.so";
 }
 
 #else
 static const char* select_impl()
 {
-    return "neuralnote_impl_baseline.so";
+    return "pipitch_impl_baseline.so";
 }
 #endif
 
@@ -97,7 +97,7 @@ static void load_impl_once(const char* bundle_path)
     }
 
     const auto entry = reinterpret_cast<ImplEntryFn>(
-        dlsym(g_impl_handle, "neuralnote_impl_descriptor"));
+        dlsym(g_impl_handle, "pipitch_impl_descriptor"));
     if (!entry) {
         dlclose(g_impl_handle);
         g_impl_handle = nullptr;

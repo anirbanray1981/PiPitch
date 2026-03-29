@@ -1,18 +1,18 @@
 #pragma once
 /**
- * NeuralNoteShared.h — constants, per-range state base, and pitch-detection
- * pipeline helpers shared between neuralnote_impl.cpp (LV2 plugin) and
- * neuralnote_tune.cpp (JACK tuning tool).
+ * PiPitchShared.h — constants, per-range state base, and pitch-detection
+ * pipeline helpers shared between pipitch_impl.cpp (LV2 plugin) and
+ * pipitch_tune.cpp (JACK tuning tool).
  *
  * Keep this header free of LV2 and JACK dependencies.
  *
  * MPM (McLeod Pitch Method) gating
  * ─────────────────────────────────
- * Define NEURALNOTE_ENABLE_MPM before including this header to compile in
+ * Define PIPITCH_ENABLE_MPM before including this header to compile in
  * McLeod calls inside armOrExpireOBP, resetOBPOnGate, runOBPHPS, and
- * RangeStateBase.  neuralnote_impl.cpp defines it before its includes when
+ * RangeStateBase.  pipitch_impl.cpp defines it before its includes when
  * __ARM_FEATURE_DOTPROD is present (Pi 5 / armv82 build).
- * neuralnote_tune.cpp always defines it.
+ * pipitch_tune.cpp always defines it.
  */
 
 #include <algorithm>
@@ -31,7 +31,7 @@
 #include "BasicPitch.h"
 #include "NoteRangeConfig.h"
 #include "OneBitPitchDetector.h"
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
 #  include "McLeodPitchDetector.h"
 #endif
 
@@ -272,7 +272,7 @@ struct RangeStateBase {
     int                 provCooldownRemain = 0;    // samples remaining
     int                 provCooldownNote   = -1;   // MIDI note under cooldown
 
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
 #endif
 
@@ -321,7 +321,7 @@ static void armOrExpireOBP(RangeT& r, float sampleRate, int nSamples, bool onset
             r.obdPendingRemain   = 0;
             r.obdVoting.reset();
             r.obd.resetDetection();
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
             r.mpm.reset();
 #endif
         }
@@ -347,7 +347,7 @@ static void resetOBPOnGate(RangeT& r) noexcept
 {
     r.obd.reset();
     r.obdVoting.reset();
-#ifdef NEURALNOTE_ENABLE_MPM
+#ifdef PIPITCH_ENABLE_MPM
     r.mpm.reset();
 #endif
     r.obpHpsBits       = 0;
@@ -638,7 +638,7 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
 // ── Shared worker thread logic ───────────────────────────────────────────────
 //
 // Template function implementing the worker loop for both the LV2 plugin
-// (neuralnote_impl.cpp) and the JACK tuning tool (neuralnote_tune.cpp).
+// (pipitch_impl.cpp) and the JACK tuning tool (pipitch_tune.cpp).
 //
 // The Hooks type must provide:
 //

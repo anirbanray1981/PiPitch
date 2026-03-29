@@ -3,10 +3,10 @@
 /**
  * NoteRangeConfig — per-note-range parameter configuration
  *
- * Config file format (INI-style, default path: neuralnote_tune.conf next to binary,
- * or neuralnote_ranges.conf inside the LV2 bundle):
+ * Config file format (INI-style, default path: pipitch_tune.conf next to binary,
+ * or pipitch_ranges.conf inside the LV2 bundle):
  *
- *   # Global settings (neuralnote_tune.conf only — not used by the LV2 plugin conf)
+ *   # Global settings (pipitch_tune.conf only — not used by the LV2 plugin conf)
  *   gate_floor      = 0.003
  *   amp_floor       = 0.65
  *   threshold       = 0.6

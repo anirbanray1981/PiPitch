@@ -1,5 +1,5 @@
 /**
- * neuralnote_tune — NeuralNote parameter sweep / latency measurement tool
+ * pipitch_tune — PiPitch parameter sweep / latency measurement tool
  *
  * Threading model
  * ───────────────
@@ -15,13 +15,13 @@
  * JACK callback — no mutex anywhere on the hot path.
  *
  * Usage:
- *   neuralnote_tune [--bundle PATH] [--config PATH]
+ *   pipitch_tune [--bundle PATH] [--config PATH]
  *                   [--threshold 0.6] [--frame-threshold 0.5] [--mode poly|mono|swiftmono|swiftpoly]
  *                   [--hold-cycles 2] [--gate 0.003] [--amp-floor 0.65] [--window 150]
  *                   [--waveform sine|saw|square]
  *                   [--attack MS] [--release MS] [--volume 0.3]
  *
- * Config file: neuralnote_tune.conf next to the binary (or --config PATH).
+ * Config file: pipitch_tune.conf next to the binary (or --config PATH).
  */
 
 #include <algorithm>
@@ -42,13 +42,13 @@
 
 #include <jack/jack.h>
 
-// MPM is always enabled in neuralnote_tune (Pi 5 target only).
-// Must be defined before NeuralNoteShared.h so that RangeStateBase and all
+// MPM is always enabled in pipitch_tune (Pi 5 target only).
+// Must be defined before PiPitchShared.h so that RangeStateBase and all
 // shared pipeline functions compile in the McLeod call-sites.
-#define NEURALNOTE_ENABLE_MPM 1
+#define PIPITCH_ENABLE_MPM 1
 
 #include "BasicPitchConstants.h"
-#include "NeuralNoteShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
+#include "PiPitchShared.h"  // pulls in BinaryData.h, BasicPitch.h, NoteRangeConfig.h,
                                // OneBitPitchDetector.h, McLeodPitchDetector.h
 #include "SwiftF0Detector.h"
 
@@ -833,10 +833,10 @@ int main(int argc, char** argv)
     if (bundlePath.empty()) {
         const std::string probes[][2] = {
             { selfDir, selfDir + "ModelData/cnn_contour_model.json" },
-            { "/zynthian/zynthian-plugins/lv2/neuralnote_guitar2midi.lv2",
-              "/zynthian/zynthian-plugins/lv2/neuralnote_guitar2midi.lv2/ModelData/cnn_contour_model.json" },
-            { "/usr/lib/lv2/neuralnote_guitar2midi.lv2",
-              "/usr/lib/lv2/neuralnote_guitar2midi.lv2/ModelData/cnn_contour_model.json" },
+            { "/zynthian/zynthian-plugins/lv2/pipitch.lv2",
+              "/zynthian/zynthian-plugins/lv2/pipitch.lv2/ModelData/cnn_contour_model.json" },
+            { "/usr/lib/lv2/pipitch.lv2",
+              "/usr/lib/lv2/pipitch.lv2/ModelData/cnn_contour_model.json" },
         };
         for (const auto& p : probes) {
             FILE* f = std::fopen(p[1].c_str(), "rb");
@@ -849,7 +849,7 @@ int main(int argc, char** argv)
     }
 
     if (configPath.empty()) {
-        std::string c = selfDir + "neuralnote_tune.conf";
+        std::string c = selfDir + "pipitch_tune.conf";
         FILE* f = std::fopen(c.c_str(), "r");
         if (f) { std::fclose(f); configPath = c; }
     }
@@ -970,7 +970,7 @@ int main(int argc, char** argv)
     }
 
     jack_status_t  status;
-    jack_client_t* client = jack_client_open("neuralnote_tune", JackNullOption, &status);
+    jack_client_t* client = jack_client_open("pipitch_tune", JackNullOption, &status);
     if (!client) { std::fprintf(stderr, "JACK connection failed (0x%x)\n", status); return 1; }
 
     mon.sampleRate = jack_get_sample_rate(client);
