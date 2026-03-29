@@ -1,5 +1,5 @@
 /**
- * NeuralNote Guitar2MIDI — LV2 CPU-dispatch wrapper
+ * PiPitch — LV2 CPU-dispatch wrapper
  *
  * This is the only .so the LV2 host loads (referenced in manifest.ttl).
  * It contains no audio-processing code; instead it:
@@ -159,7 +159,7 @@ static const void* w_extension_data(const char* uri)
 // ── LV2 descriptor ───────────────────────────────────────────────────────────
 
 static const LV2_Descriptor wrapper_descriptor = {
-    "https://github.com/DamRsn/NeuralNote/guitar2midi",
+    "https://github.com/anirbanray1981/PiPitch",
     w_instantiate,
     w_connect_port,
     w_activate,

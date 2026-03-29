@@ -1,5 +1,5 @@
 /**
- * NeuralNote Guitar2MIDI — Latency Benchmark
+ * PiPitch — Latency Benchmark
  *
  * Measures the wall-clock cost of BasicPitch::transcribeToMIDI() and
  * reports end-to-end note latency for common LV2 host block sizes.
