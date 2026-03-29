@@ -1,5 +1,5 @@
 /**
- * NeuralNote Guitar2MIDI — LV2 Implementation (low-latency streaming)
+ * PiPitch — LV2 Implementation (low-latency streaming)
  *
  * Compiled multiple times with different -march flags by CMake.
  * Loaded by neuralnote_guitar2midi.so (the wrapper) via dlopen().
@@ -58,7 +58,7 @@
                                // OneBitPitchDetector.h, McLeodPitchDetector.h (if MPM)
 #include "SwiftF0Detector.h"
 
-#define PLUGIN_URI "https://github.com/DamRsn/NeuralNote/guitar2midi"
+#define PLUGIN_URI "https://github.com/anirbanray1981/PiPitch"
 
 #ifndef NEURALNOTE_IMPL_NAME
 #define NEURALNOTE_IMPL_NAME "neuralnote_impl"
@@ -329,7 +329,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     self->workerThread = std::thread(runWorker, self);
 
     lv2_log_note(&self->logger,
-                 "NeuralNote Guitar2MIDI: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
+                 "PiPitch: %.0f Hz  [impl: " NEURALNOTE_IMPL_NAME
                  "]  [ranges: %zu, single worker thread]\n", rate, self->ranges.size());
     return static_cast<LV2_Handle>(self);
 }

@@ -8,9 +8,9 @@
 @prefix urid:  <http://lv2plug.in/ns/ext/urid#> .
 @prefix units: <http://lv2plug.in/ns/extensions/units#> .
 
-<https://github.com/DamRsn/NeuralNote/guitar2midi>
+<https://github.com/anirbanray1981/PiPitch>
     a lv2:Plugin, lv2:ConverterPlugin ;
-    doap:name        "NeuralNote Guitar2MIDI" ;
+    doap:name        "PiPitch" ;
     doap:license     <http://opensource.org/licenses/Apache-2.0> ;
     doap:maintainer  [ doap:name "Damien Ronssin" ] ;
     lv2:requiredFeature urid:map ;
