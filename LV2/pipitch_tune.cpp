@@ -833,6 +833,8 @@ int main(int argc, char** argv)
     if (bundlePath.empty()) {
         const std::string probes[][2] = {
             { selfDir, selfDir + "ModelData/cnn_contour_model.json" },
+            { selfDir + "pipitch.lv2",
+              selfDir + "pipitch.lv2/ModelData/cnn_contour_model.json" },
             { "/zynthian/zynthian-plugins/lv2/pipitch.lv2",
               "/zynthian/zynthian-plugins/lv2/pipitch.lv2/ModelData/cnn_contour_model.json" },
             { "/usr/lib/lv2/pipitch.lv2",
@@ -930,9 +932,11 @@ int main(int argc, char** argv)
     {
         std::string sf0Path;
         // Try next to binary first, then bundle path
+        const std::string bslash = (bundlePath.empty() || bundlePath.back() == '/') ? "" : "/";
         const std::string probes[] = {
             selfDir + "swift_f0_model.onnx",
-            bundlePath + (bundlePath.empty() || bundlePath.back() == '/' ? "" : "/") + "swift_f0_model.onnx"
+            bundlePath + bslash + "swift_f0_model.onnx",
+            selfDir + "pipitch.lv2/swift_f0_model.onnx",
         };
         for (const auto& p : probes) {
             FILE* f = std::fopen(p.c_str(), "rb");

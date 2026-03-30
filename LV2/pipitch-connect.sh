@@ -8,12 +8,15 @@
 # Edit the EXTRA_DSTS array to match your Zynthian synth chain layout.
 # ──────────────────────────────────────────────────────────────────────────
 
-SRC="ZynMidiRouter:ch0_out"
+# PiPitch MIDI output → ZynMidiRouter input (essential — always needed)
+PIPITCH_SRC="PiPitch-01:midi_out"
+PIPITCH_DST="ZynMidiRouter:dev0_in"
 
-# Add / remove destination ports to match your synth chains.
+# ZynMidiRouter fan-out to additional synth chains.
 # zynaddsubfx-01 is managed by Zynthian's autoconnect automatically;
 # list only the chains it does NOT connect on its own.
-EXTRA_DSTS=(
+FANOUT_SRC="ZynMidiRouter:ch0_out"
+FANOUT_DSTS=(
     "fluidsynth:midi_00"
     "LinuxSampler:midi_in_0"
 )
@@ -46,6 +49,10 @@ connect() {
     fi
 }
 
-for dst in "${EXTRA_DSTS[@]}"; do
-    connect "$SRC" "$dst"
+# Primary: PiPitch → ZynMidiRouter
+connect "$PIPITCH_SRC" "$PIPITCH_DST"
+
+# Fan-out: ZynMidiRouter → extra synth chains
+for dst in "${FANOUT_DSTS[@]}"; do
+    connect "$FANOUT_SRC" "$dst"
 done
