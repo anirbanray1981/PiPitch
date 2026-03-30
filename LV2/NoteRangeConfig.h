@@ -62,6 +62,7 @@ struct RangeConfig {
     float     frameThreshold = 0.5f;   // frame confidence (0.05–0.95)
     float     onsetBlankMs      = 25.0f;  // re-trigger suppression window (ms)
     float     swiftF0Threshold  = 0.5f;   // SwiftF0 per-frame confidence (swiftmono mode)
+    float     octaveLockMs      = 250.0f;  // suppress ±12/24 semitone jumps in swiftmono (0=off)
     PlayMode  mode              = PlayMode::MONO;
     ProvMode  provisionalMode  = ProvMode::ON;
 };
@@ -124,6 +125,7 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
             else                         cfg.mode = PlayMode::POLY;
             continue;
         }
+        if (key == "octave_lock_ms")  { cfg.octaveLockMs    = std::stof(val); continue; }
         if (key == "provisional") {
             if      (val == "swift") cfg.provisionalMode = ProvMode::SWIFT;
             else if (val == "none")  cfg.provisionalMode = ProvMode::NONE;
