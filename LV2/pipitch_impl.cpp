@@ -132,6 +132,7 @@ struct PiPitchPlugin {
     std::atomic<float> ampFloorVal{0.65f};
     std::atomic<int>   modeVal{1};  // 0=poly, 1=mono, 2=swiftmono, 3=swiftpoly (default: mono)
     std::atomic<int>   provisionalVal{0};  // 0=on, 1=swift, 2=none
+    float              octaveLockMsVal = 250.0f;  // from config (not an LV2 port)
 
     std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
     std::vector<float>               sf0Buf;   // worker-thread scratch: 16 kHz resampled audio
@@ -146,6 +147,7 @@ struct PiPitchPlugin {
     // HPF pick detector (run() thread only)
     PickDetector pickDetector;
     int          pickFiredRemain = 0;  // samples remaining since last PICK; >0 = recent pick
+    float        lastPickRatio   = 0.0f;  // ratio of the most recent PICK fire
 
     // Onset-recency tracking (audio → worker, for decay-tail ghost suppression)
     std::atomic<uint64_t> totalSamples{0};
@@ -175,6 +177,7 @@ struct ImplWorkerHooks {
     uint64_t            totalSamples()   { return self->totalSamples.load(std::memory_order_relaxed); }
     uint64_t            lastOnsetSample(){ return self->lastOnsetSample.load(std::memory_order_acquire); }
     int                 provisionalMode(){ return self->provisionalVal.load(std::memory_order_relaxed); }
+    float               octaveLockMs()   { return self->octaveLockMsVal; }
     auto&               ranges()         { return self->ranges; }
 
     // No logging in LV2 plugin
@@ -284,6 +287,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     if (!cfgPath.empty() && cfgPath.back() != '/') cfgPath += '/';
     cfgPath += "pipitch_ranges.conf";
     RangeConfig rangeCfg = loadRangeConfig(cfgPath);
+    self->octaveLockMsVal = rangeCfg.octaveLockMs;
 
     auto makeRange = [&](const NoteRange& cfg) {
         auto r             = std::make_unique<RangeState>();
@@ -323,7 +327,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
         self->ranges.push_back(makeRange(def));
     }
 
-    self->pickDetector.init(static_cast<float>(rate));
+    self->pickDetector.init(static_cast<float>(rate), 3000.0f, 3.0f);
 
     sem_init(&self->workerSem, 0, 0);
     self->workerThread = std::thread(runWorker, self);
@@ -449,6 +453,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         for (auto& rp2 : self->ranges)
             { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
         self->pickFiredRemain = static_cast<int>(self->sampleRate * 0.05);  // 50ms window
+        self->lastPickRatio   = pickRatio;
         const float blankMs = (self->onsetBlankMsPort && *self->onsetBlankMsPort > 0.0f)
                                   ? *self->onsetBlankMsPort : ONSET_BLANK_MS;
         self->onsetBlankRemain = static_cast<int>(self->sampleRate * (blankMs / 1000.0f));
@@ -502,13 +507,48 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 // Skip if same note is under cooldown (RMS re-trigger suppression)
                 if (r.provCooldownRemain > 0 && note == r.provCooldownNote)
                     return;
-                // High-note harmonic suppression: when a note >= E5 is active in
-                // another range, this provisional is likely a sympathetic harmonic.
+                // Below-C3 filter: in swiftpoly, always discard provisionals
+                // below C3 (harmonics from higher notes). In other modes,
+                // discard from silence only.
+                if (note < MIDI_NOTE_C3) {
+                    const int mv = self->modeVal.load(std::memory_order_relaxed);
+                    if (mv == 3) return;  // swiftpoly: always discard <C3
+                    bool anyActive = false;
+                    for (auto& other : self->ranges) {
+                        if (other->activeNotesBits.load(std::memory_order_acquire) != 0
+                            || other->provNote.load(std::memory_order_acquire) != -1)
+                            { anyActive = true; break; }
+                    }
+                    if (!anyActive) return;  // from silence: discard <C3
+                }
+                // Octave-lock (cross-range): suppress ±12/±24 semitone provisionals
+                // relative to any active note OR recent provisional across all ranges.
+                // Checks both activeNotesBits (worker-updated) and provNote (audio-set)
+                // since the worker may not have promoted a recent provisional yet.
+                if (self->octaveLockMsVal > 0.0f) {
+                    for (auto& other : self->ranges) {
+                        const uint64_t bits = other->activeNotesBits.load(std::memory_order_acquire);
+                        for (uint64_t tmp = bits; tmp; tmp &= tmp - 1) {
+                            const int act = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+                            const int diff = std::abs(note - act);
+                            if (diff == 12 || diff == 24) return;
+                        }
+                        const int prov = other->provNote.load(std::memory_order_acquire);
+                        if (prov != -1) {
+                            const int diff = std::abs(note - prov);
+                            if (diff == 12 || diff == 24) return;
+                        }
+                    }
+                }
+                // Mono cross-range guard: in mono mode, suppress provisional if
+                // any OTHER range already has an active note or pending provisional.
+                // Only the first range to fire wins; SwiftF0 corrects later.
                 if (self->modeVal.load(std::memory_order_relaxed) >= 1) {
-                    constexpr uint64_t highMask = ~((1ULL << (MIDI_NOTE_E5 - NOTE_BASE)) - 1);
                     for (auto& other : self->ranges) {
                         if (&*other == &r) continue;
-                        if (other->activeNotesBits.load(std::memory_order_acquire) & highMask)
+                        if (other->activeNotesBits.load(std::memory_order_acquire) != 0)
+                            return;
+                        if (other->provNote.load(std::memory_order_acquire) != -1)
                             return;
                     }
                 }
@@ -518,6 +558,9 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                     const uint64_t bits = r.activeNotesBits.load(std::memory_order_acquire);
                     if (bits & (1ULL << (note - NOTE_BASE))) {
                         if (self->pickFiredRemain <= 0) return;  // no recent PICK → skip
+                        // E2-B2 range: require stronger PICK for re-hits (avoid
+                        // sympathetic resonance triggers). C3+: lower threshold OK.
+                        if (note < 48 && self->lastPickRatio < 4.0f) return;
                         // PICK-triggered re-hit: send OFF first for clean retrigger
                         writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
                                   0x80, static_cast<uint8_t>(note), uint8_t(0));

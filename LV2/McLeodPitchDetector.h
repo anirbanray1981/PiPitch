@@ -119,7 +119,7 @@ struct McLeodPitchDetector {
         const int maxLag = static_cast<int>(sampleRate / freqLow) + 4;
         const int needed = std::min(maxLag * 2, MPM_BUFSIZE);
         minFill = ((needed + 63) & ~63);  // round up to next 64-sample boundary
-        if (minFill < 64)  minFill = 64;
+        if (minFill < 512) minFill = 512; // floor: MPM unreliable below ~10ms
         if (minFill > MPM_BUFSIZE) minFill = MPM_BUFSIZE;
 
         // Allocate FFTW-aligned memory

@@ -585,7 +585,13 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
     // sustained note would cause spurious stutters every time a cycle is missed.
     // Same-note staccato re-hits are handled at the provisional level by fireProv
     // reading activeNotesBits and sending OFF before ON.
-    const uint64_t returning = newBits & r.holdNotes;
+    // Mono: don't let held notes return if a different note is active in this range.
+    // Prevents SwiftF0 oscillation (e.g. G3/A3 legato) from keeping old notes alive.
+    uint64_t returning = newBits & r.holdNotes;
+    if (mono && returning && (r.activeNotes & ~r.holdNotes)) {
+        // There are non-held active notes — block returning held notes
+        returning = 0;
+    }
     for (uint64_t tmp = returning; tmp; tmp &= tmp - 1)
         r.holdCounts[__builtin_ctzll(tmp)] = 0;
     r.holdNotes &= ~returning;
@@ -793,6 +799,42 @@ static void runWorkerCommon(Hooks& h)
                     const auto gate = static_cast<uint64_t>(h.sampleRate() * ONSET_GATE_S);
                     if (elapsed > gate)
                         newBits = 0;
+                }
+
+                // Octave-lock (cross-range): suppress ±12/±24 semitone jumps
+                // when no recent onset.  Checks against active notes in ALL
+                // ranges, not just the current one — catches octave harmonics
+                // that land in a different range (e.g. B4 in C4-B4 → B3 in C3-B3).
+                if (newBits) {
+                    const float lockMs = h.octaveLockMs();
+                    if (lockMs > 0.0f) {
+                        // Gather active notes from all ranges
+                        uint64_t allActive = 0;
+                        for (const auto& rp : ranges)
+                            allActive |= rp->activeNotes | rp->holdNotes;
+
+                        if (allActive) {
+                            const int det = NOTE_BASE + __builtin_ctzll(newBits);
+                            bool isOctaveJump = false;
+                            for (uint64_t tmp = allActive; tmp; tmp &= tmp - 1) {
+                                const int act = NOTE_BASE + __builtin_ctzll(tmp);
+                                const int diff = std::abs(det - act);
+                                if (diff == 12 || diff == 24) { isOctaveJump = true; break; }
+                            }
+                            if (isOctaveJump) {
+                                const uint64_t elapsed =
+                                    h.totalSamples() - h.lastOnsetSample();
+                                const auto lockSamples = static_cast<uint64_t>(
+                                    h.sampleRate() * lockMs / 1000.0);
+                                if (elapsed > lockSamples) {
+                                    // No recent onset → harmonic error, suppress
+                                    newBits = r.activeNotes;
+                                    for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                                        newVel[__builtin_ctzll(tmp)] = 100;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Note-change confirmation: require 2 consecutive cycles of the
@@ -1018,17 +1060,76 @@ static void runWorkerCommon(Hooks& h)
             if (!swiftMono && !swiftPoly && provForDiff != -1)
                 h.onCNNOutcome(r, provForDiff, newBits, inferMs);
 
+            // SwiftMono pre-filter: if another range already has a higher active
+            // note, suppress this range's detection entirely.  Prevents stale
+            // lower-range harmonics (e.g. B3 from B4 decay) from briefly firing
+            // before range priority can kill them.
+            if (swiftMono && newBits && newBits != r.activeNotes) {
+                const int det = NOTE_BASE + static_cast<int>(__builtin_ctzll(newBits));
+                for (const auto& rp : ranges) {
+                    if (&*rp == &r) continue;
+                    if (!rp->activeNotes) continue;
+                    const int top = NOTE_BASE + (63 - __builtin_clzll(rp->activeNotes));
+                    if (top > det) {
+                        newBits = r.activeNotes;  // keep current state, suppress new detection
+                        for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                            newVel[__builtin_ctzll(tmp)] = 100;
+                        break;
+                    }
+                }
+            }
+
             applyNotesDiff(r, newBits, newVel, provForDiff, mono,
                            swiftMono ? r.cfg.swiftHoldCycles : -1);
 
             // Notes changed hook (ON/OFF logging)
             h.onNotesChanged(r, prevActive, newVel, inferMs, modeLabel);
 
-            // Mono cross-range: new note-ON(s) → kill all other ranges
-            if (mono && (r.activeNotes & ~prevActive)) {
+            // Mono cross-range: new note-ON(s) → kill all other ranges.
+            // In swiftMono, defer to end-of-cycle priority resolution (below)
+            // to prevent cross-range oscillation between stale and fresh detections.
+            if (mono && !swiftMono && (r.activeNotes & ~prevActive)) {
                 for (int oi = 0; oi < static_cast<int>(ranges.size()); ++oi) {
                     if (oi == ri) continue;
                     auto& other = *ranges[oi];
+                    for (uint64_t tmp = other.activeNotes; tmp; tmp &= tmp - 1) {
+                        const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+                        h.onMonoKill(other, p);
+                        other.midiOut.push({false, p, 0});
+                    }
+                    other.activeNotes = 0;
+                    other.holdNotes   = 0;
+                    std::memset(other.holdCounts, 0, NOTE_COUNT);
+                    other.monoHeldNote.store(-1, std::memory_order_release);
+                }
+            }
+        }
+
+        // SwiftMono range priority: after all ranges are processed, if multiple
+        // ranges have active notes, keep only the highest MIDI note and kill the
+        // rest.  Higher-register detections are more reliable; lower-register
+        // conflicts are typically stale-ring harmonics (e.g. B3 from decaying B4).
+        if (swiftMono) {
+            // Find the highest active note across all ranges
+            int bestNote = -1;
+            int bestRange = -1;
+            for (int ri2 = 0; ri2 < static_cast<int>(ranges.size()); ++ri2) {
+                const auto& rr = *ranges[ri2];
+                if (!rr.activeNotes) continue;
+                // Highest bit = highest MIDI note in this range
+                const int topBit = 63 - __builtin_clzll(rr.activeNotes);
+                const int topNote = NOTE_BASE + topBit;
+                if (topNote > bestNote) {
+                    bestNote = topNote;
+                    bestRange = ri2;
+                }
+            }
+            // Kill all other ranges
+            if (bestRange >= 0) {
+                for (int ri2 = 0; ri2 < static_cast<int>(ranges.size()); ++ri2) {
+                    if (ri2 == bestRange) continue;
+                    auto& other = *ranges[ri2];
+                    if (!other.activeNotes) continue;
                     for (uint64_t tmp = other.activeNotes; tmp; tmp &= tmp - 1) {
                         const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
                         h.onMonoKill(other, p);

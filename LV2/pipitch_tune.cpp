@@ -128,6 +128,7 @@ struct Monitor {
     float    frameThreshold = 0.5f;
     PlayMode mode           = PlayMode::POLY;
     ProvMode provisionalMode = ProvMode::ON;
+    float    octaveLockMs    = 250.0f;
 
     std::vector<std::unique_ptr<RangeState>> ranges;
 
@@ -150,6 +151,7 @@ struct Monitor {
     // HPF pick detector (jackProcess thread only)
     PickDetector pickDetector;
     int          pickFiredRemain = 0;  // samples remaining since last PICK; >0 = recent pick
+    float        lastPickRatio   = 0.0f;  // ratio of the most recent PICK fire
 
     // Onset-recency tracking (audio → worker, for decay-tail ghost suppression)
     std::atomic<uint64_t> totalSamples{0};
@@ -191,6 +193,7 @@ struct TuneWorkerHooks {
     uint64_t            totalSamples()   { return m->totalSamples.load(std::memory_order_relaxed); }
     uint64_t            lastOnsetSample(){ return m->lastOnsetSample.load(std::memory_order_acquire); }
     int                 provisionalMode(){ return static_cast<int>(m->provisionalMode); }
+    float               octaveLockMs()   { return m->octaveLockMs; }
     auto&               ranges()         { return m->ranges; }
 
     double elapsed() const {
@@ -335,6 +338,8 @@ static void processSynth(Monitor* m, float* out, int nFrames)
             const uint64_t bits = rp.activeNotesBits.load(std::memory_order_acquire);
             if (bits & (1ULL << (pp - NOTE_BASE))) {
                 if (m->pickFiredRemain <= 0) continue;
+                // E2-B2: require stronger PICK for re-hits. C3+: lower threshold OK.
+                if (pp < 48 && m->lastPickRatio < 4.0f) continue;
                 // PICK-triggered re-hit: release existing voice for clean retrigger
                 for (auto& v : m->voices)
                     if (v.pitch == pp && v.state != 0 && v.state != 3)
@@ -524,6 +529,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         for (auto& rp2 : m->ranges)
             { rp2->provCooldownRemain = 0; rp2->provCooldownNote = -1; }
         m->pickFiredRemain = static_cast<int>(m->sampleRate * 0.05);  // 50ms window
+        m->lastPickRatio   = pickRatioVal;
         m->onsetBlankRemain = static_cast<int>(m->sampleRate * (m->onsetBlankMs / 1000.0f));
         m->onsetSmoothedRms = blockRms;
         m->lastOnsetSample.store(
@@ -577,6 +583,52 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         const bool provEnabled = (m->provisionalMode == ProvMode::ON);
         if (provEnabled) {
 
+        // Mono cross-range guard: in mono mode, returns true if any OTHER range
+        // already has an active note or pending provisional.
+        auto isMonoBlocked = [&](const RangeState& thisRange) -> bool {
+            if (m->mode != PlayMode::MONO && m->mode != PlayMode::SWIFT_MONO) return false;
+            for (const auto& rp2 : m->ranges) {
+                if (&*rp2 == &thisRange) continue;
+                if (rp2->activeNotesBits.load(std::memory_order_acquire) != 0) return true;
+                if (rp2->provNote.load(std::memory_order_acquire) != -1) return true;
+            }
+            return false;
+        };
+
+        // Below-C3 filter: in swiftpoly, always block provisionals below C3.
+        // In other modes, block from silence only.
+        auto isSilenceLowBlocked = [&](int note) -> bool {
+            if (note >= MIDI_NOTE_C3) return false;
+            if (m->mode == PlayMode::SWIFT_POLY) return true;  // always discard <C3
+            for (const auto& rp2 : m->ranges) {
+                if (rp2->activeNotesBits.load(std::memory_order_acquire) != 0) return false;
+                if (rp2->provNote.load(std::memory_order_acquire) != -1) return false;
+            }
+            return true;  // silence + note < C3 → block
+        };
+
+        // Octave-lock helper for provisionals: returns true if the note is
+        // ±12/±24 semitones from any active note or recent provisional across
+        // all ranges.  Checks provNote too since the worker may not have
+        // promoted a recent provisional to activeNotesBits yet.
+        auto isOctaveLocked = [&](int note) -> bool {
+            if (m->octaveLockMs <= 0.0f) return false;
+            for (const auto& rp2 : m->ranges) {
+                const uint64_t bits = rp2->activeNotesBits.load(std::memory_order_acquire);
+                for (uint64_t tmp = bits; tmp; tmp &= tmp - 1) {
+                    const int act = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+                    const int diff = std::abs(note - act);
+                    if (diff == 12 || diff == 24) return true;
+                }
+                const int prov = rp2->provNote.load(std::memory_order_acquire);
+                if (prov != -1) {
+                    const int diff = std::abs(note - prov);
+                    if (diff == 12 || diff == 24) return true;
+                }
+            }
+            return false;
+        };
+
         armOrExpireOBP(r, static_cast<float>(m->sampleRate),
                        static_cast<int>(nFrames), onsetFired);
 
@@ -613,6 +665,17 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                     { suppress = true; break; }
                             }
                         }
+                        if (!suppress && isSilenceLowBlocked(mpmNote)) {
+                            suppress = true;
+                        }
+                        if (!suppress && isOctaveLocked(mpmNote)) {
+                            suppress = true;
+                            std::printf("[+%.3fs]  --   MPM fallback → %-4s(%d)"
+                                        "  suppressed (octave-lock)  [range %s]\n",
+                                        elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                        }
                         if (!suppress) {
                             std::printf("[+%.3fs]  --   MPM fallback (fill %d): %-4s(%d)"
                                         "  prov fired  [range %s]\n",
@@ -623,7 +686,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                             r.provMidiPitch = mpmNote;
                             r.provNote.store(mpmNote, std::memory_order_release);
                             r.monoHeldNote.store(mpmNote, std::memory_order_release);
-                        } else {
+                        } else if (!isOctaveLocked(mpmNote)) {
                             std::printf("[+%.3fs]  --   OBP expired  MPM→%-4s(%d)"
                                         "  suppressed (mono)  [range %s]\n",
                                         elapsed, midiToName(mpmNote).c_str(), mpmNote,
@@ -653,6 +716,25 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
                     } else if (mpmNote == finalNote) {
+                        if (isSilenceLowBlocked(finalNote)) {
+                            std::printf("[+%.3fs]  --   OBP+MPM agree: %-4s(%d)"
+                                        "  suppressed (silence<C3)  [range %s]\n",
+                                        elapsed, midiToName(finalNote).c_str(), finalNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                        } else if (isMonoBlocked(r)) {
+                            std::printf("[+%.3fs]  --   OBP+MPM agree: %-4s(%d)"
+                                        "  suppressed (mono)  [range %s]\n",
+                                        elapsed, midiToName(finalNote).c_str(), finalNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                        } else if (isOctaveLocked(finalNote)) {
+                            std::printf("[+%.3fs]  --   OBP+MPM agree: %-4s(%d)"
+                                        "  suppressed (octave-lock)  [range %s]\n",
+                                        elapsed, midiToName(finalNote).c_str(), finalNote,
+                                        r.cfg.name.c_str());
+                            std::fflush(stdout);
+                        } else {
                         // OBP + MPM agree — fire immediately
                         std::printf("[+%.3fs]  --   OBP+MPM agree (fill %d): %-4s(%d)"
                                     "  prov fired  [range %s]\n",
@@ -663,6 +745,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                         r.provMidiPitch = finalNote;
                         r.provNote.store(finalNote, std::memory_order_release);
                         r.monoHeldNote.store(finalNote, std::memory_order_release);
+                        }
                     } else {
                         // OBP + MPM disagree — save pending; retry with more data
                         r.obdPendingNote   = finalNote;
@@ -720,6 +803,22 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
                                     elapsed, midiToName(mpmNote).c_str(), mpmNote,
                                     r.cfg.name.c_str());
                         std::fflush(stdout);
+                    } else if (isSilenceLowBlocked(mpmNote)) {
+                        r.obdPendingNote = -1;
+                    } else if (isMonoBlocked(r)) {
+                        r.obdPendingNote = -1;
+                        std::printf("[+%.3fs]  --   MPM→%-4s(%d)"
+                                    "  suppressed (mono)  [range %s]\n",
+                                    elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                    r.cfg.name.c_str());
+                        std::fflush(stdout);
+                    } else if (isOctaveLocked(mpmNote)) {
+                        r.obdPendingNote = -1;
+                        std::printf("[+%.3fs]  --   MPM→%-4s(%d)"
+                                    "  suppressed (octave-lock)  [range %s]\n",
+                                    elapsed, midiToName(mpmNote).c_str(), mpmNote,
+                                    r.cfg.name.c_str());
+                        std::fflush(stdout);
                     } else {
                         if (mpmNote != pending) {
                             std::printf("[+%.3fs]  --   MPM corrects pending OBP→%-4s(%d)"
@@ -771,6 +870,7 @@ int main(int argc, char** argv)
     bool     modeSet         = false;
     ProvMode provisionalMode = ProvMode::ON;
     bool     provisionalSet  = false;
+    float    octaveLockMs   = -1.0f;  // <0 = use config default
     Waveform waveform       = Waveform::SINE;
     float    attackMs       = 10.0f;
     float    releaseMs      = 400.0f;
@@ -802,6 +902,7 @@ int main(int argc, char** argv)
             else                               provisionalMode = ProvMode::ON;
             provisionalSet = true;
         }
+        else if (!std::strcmp(argv[i], "--octave-lock")     && i+1 < argc) octaveLockMs   = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--attack")          && i+1 < argc) attackMs       = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--release")         && i+1 < argc) releaseMs      = std::stof(argv[++i]);
         else if (!std::strcmp(argv[i], "--volume")          && i+1 < argc) masterVol      = std::stof(argv[++i]);
@@ -872,6 +973,7 @@ int main(int argc, char** argv)
     if (swiftThreshold >= 0.0f)  rangeCfg.swiftF0Threshold = swiftThreshold;
     if (modeSet)                 rangeCfg.mode             = mode;
     if (provisionalSet)          rangeCfg.provisionalMode  = provisionalMode;
+    if (octaveLockMs >= 0.0f)    rangeCfg.octaveLockMs     = octaveLockMs;
 
     if (rangeCfg.ranges.empty()) {
         NoteRange low;
@@ -901,6 +1003,8 @@ int main(int argc, char** argv)
                 rangeCfg.provisionalMode == ProvMode::SWIFT ? " swift" :
                 rangeCfg.provisionalMode == ProvMode::NONE  ? " none" : " on");
     std::printf("OnsetBlank: %.0f ms\n", rangeCfg.onsetBlankMs);
+    std::printf("OctaveLock: %.0f ms%s\n", rangeCfg.octaveLockMs,
+                rangeCfg.octaveLockMs <= 0.0f ? " [disabled]" : "");
     std::printf("Dispatch:   window/2 per range (onset overrides; floor %.0f ms)\n",
                 MIN_FRESH_FLOOR / static_cast<float>(PLUGIN_SR) * 1000.0f);
     std::printf("\nNote ranges (%zu, single worker thread):\n", rangeCfg.ranges.size());
@@ -927,6 +1031,7 @@ int main(int argc, char** argv)
     mon.swiftF0Threshold = rangeCfg.swiftF0Threshold;
     mon.mode            = rangeCfg.mode;
     mon.provisionalMode = rangeCfg.provisionalMode;
+    mon.octaveLockMs    = rangeCfg.octaveLockMs;
 
     // Try to load SwiftF0 model
     {
@@ -981,7 +1086,7 @@ int main(int argc, char** argv)
     std::printf("JACK:       %.0f Hz, buffer %u frames\n", mon.sampleRate, jack_get_buffer_size(client));
 
     // Configure HPF pick detector.
-    mon.pickDetector.init(static_cast<float>(mon.sampleRate));
+    mon.pickDetector.init(static_cast<float>(mon.sampleRate), 3000.0f, 3.0f);
 
     // Configure per-range OBP lowpass and MPM (both need sample rate).
     for (auto& rp : mon.ranges) {
