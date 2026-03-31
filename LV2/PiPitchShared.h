@@ -139,9 +139,10 @@ struct PitchBendTracker {
     static constexpr float ONSET_MASK_MS     = 30.0f;   // no bend during attack
     static constexpr float STABILITY_THRESH  = 0.85f;   // confidence gate
     static constexpr int   STABILITY_FRAMES  = 3;       // consecutive stable frames
-    static constexpr float DEAD_ZONE_CENTS   = 5.0f;    // ± dead zone around MIDI center
-    static constexpr float MAX_BEND_CENTS    = 100.0f;  // beyond this → note change
+    static constexpr float DEAD_ZONE_CENTS   = 10.0f;   // ± dead zone around MIDI center
+    static constexpr float MAX_BEND_CENTS    = 50.0f;   // beyond this → ignore (oscillation artifact)
     static constexpr float BEND_RANGE_CENTS  = 200.0f;  // ±2 semitones (standard MIDI)
+    static constexpr float HYSTERESIS_CENTS  = 3.0f;    // min change to send new bend event
 
     int   stableCount   = 0;     // consecutive high-confidence frames
     bool  bendActive    = false; // true once stability gate passed
@@ -196,7 +197,9 @@ struct PitchBendTracker {
         int bendVal = 8192 + static_cast<int>((centDiff / BEND_RANGE_CENTS) * 8191.0f);
         bendVal = std::clamp(bendVal, 0, 16383);
 
-        if (bendVal == lastBendValue) return -1;  // no change
+        // Hysteresis: only send if change exceeds threshold
+        const int minChange = static_cast<int>((HYSTERESIS_CENTS / BEND_RANGE_CENTS) * 8191.0f);
+        if (std::abs(bendVal - lastBendValue) < minChange) return -1;
         lastBendValue = bendVal;
         return bendVal;
     }
@@ -1326,23 +1329,29 @@ static void runWorkerCommon(Hooks& h)
                 const int activeNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
                 // Reset on note change
                 if (r.activeNotes != prevActive) r.bendTracker.reset();
-                // Only track bend when SwiftF0 detects the same MIDI note.
-                // If silent or drifting to a different note (decay), snap to center
-                // to prevent the pitch from dropping audibly at end of note.
-                const int sf0Midi = (sf0Hz > 20.0f)
-                    ? static_cast<int>(std::round(69.0f + 12.0f * std::log2(sf0Hz / 440.0f)))
-                    : -1;
-                if (sf0Midi == activeNote) {
-                    const uint64_t elSamples =
-                        h.totalSamples() - h.lastOnsetSample();
-                    const float msSinceOnset = static_cast<float>(
-                        elSamples * 1000.0 / h.sampleRate());
-                    const int bendVal = r.bendTracker.update(
-                        activeNote, sf0Hz, sf0MaxConf, msSinceOnset);
-                    if (bendVal >= 0)
-                        r.midiOut.push(PendingNote::bend(bendVal));
+                // Track bend when SwiftF0 has a valid Hz reading.
+                // Use the active note as the bend reference — don't require
+                // sf0Midi to match exactly (the note lock may force a different
+                // MIDI note than SwiftF0 detects, but the Hz is still valid).
+                if (sf0Hz > 20.0f) {
+                    // Check if Hz is within ±2 semitones of active note (bend range)
+                    const float centerHz = 440.0f * std::pow(2.0f, (activeNote - 69) / 12.0f);
+                    const float centDiff = 1200.0f * std::log2(sf0Hz / centerHz);
+                    if (std::fabs(centDiff) <= 50.0f) {  // within ±half semitone
+                        const uint64_t elSamples =
+                            h.totalSamples() - h.lastOnsetSample();
+                        const float msSinceOnset = static_cast<float>(
+                            elSamples * 1000.0 / h.sampleRate());
+                        const int bendVal = r.bendTracker.update(
+                            activeNote, sf0Hz, sf0MaxConf, msSinceOnset);
+                        if (bendVal >= 0)
+                            r.midiOut.push(PendingNote::bend(bendVal));
+                    } else if (r.bendTracker.bendActive) {
+                        r.midiOut.push(PendingNote::bend(8192));
+                        r.bendTracker.reset();
+                    }
                 } else if (r.bendTracker.bendActive) {
-                    // SwiftF0 silent or drifted — snap to center
+                    // SwiftF0 silent — snap to center
                     r.midiOut.push(PendingNote::bend(8192));
                     r.bendTracker.reset();
                 }
