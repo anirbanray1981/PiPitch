@@ -65,6 +65,7 @@ struct RangeConfig {
     float     octaveLockMs      = 250.0f;  // suppress ±12/24 semitone jumps in swiftmono (0=off)
     PlayMode  mode              = PlayMode::MONO;
     ProvMode  provisionalMode  = ProvMode::ON;
+    bool      bendEnabled      = false;  // 14-bit MIDI pitch bend (swiftmono only)
 };
 
 // Return the first range whose [midiLow, midiHigh] contains pitch, or nullptr.
@@ -126,6 +127,10 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
             continue;
         }
         if (key == "octave_lock_ms")  { cfg.octaveLockMs    = std::stof(val); continue; }
+        if (key == "bend") {
+            cfg.bendEnabled = (val == "on" || val == "true" || val == "1");
+            continue;
+        }
         if (key == "provisional") {
             if      (val == "swift") cfg.provisionalMode = ProvMode::SWIFT;
             else if (val == "none" || val == "off") cfg.provisionalMode = ProvMode::NONE;

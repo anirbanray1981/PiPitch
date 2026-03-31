@@ -125,14 +125,104 @@ struct PickDetector {
     }
 };
 
+// ── Pitch bend tracker ───────────────────────────────────────────────────────
+//
+// Implements conditional pitch-bend logic for natural vibrato/bending while
+// keeping staccato notes locked to the chromatic grid.  Gates:
+//   1. Onset mask: no bend during first ONSET_MASK_MS after onset
+//   2. Stability gate: SwiftF0 maxConfidence must exceed STABILITY_THRESH
+//      for STABILITY_FRAMES consecutive inferences
+//   3. Dead zone: deviations < DEAD_ZONE_CENTS send center (8192)
+//   4. Max bend: deviations > MAX_BEND_CENTS trigger note change, not bend
+
+struct PitchBendTracker {
+    static constexpr float ONSET_MASK_MS     = 30.0f;   // no bend during attack
+    static constexpr float STABILITY_THRESH  = 0.85f;   // confidence gate
+    static constexpr int   STABILITY_FRAMES  = 3;       // consecutive stable frames
+    static constexpr float DEAD_ZONE_CENTS   = 5.0f;    // ± dead zone around MIDI center
+    static constexpr float MAX_BEND_CENTS    = 100.0f;  // beyond this → note change
+    static constexpr float BEND_RANGE_CENTS  = 200.0f;  // ±2 semitones (standard MIDI)
+
+    int   stableCount   = 0;     // consecutive high-confidence frames
+    bool  bendActive    = false; // true once stability gate passed
+    int   lastBendValue = 8192;  // last sent bend (center = 8192)
+
+    void reset() { stableCount = 0; bendActive = false; lastBendValue = 8192; }
+
+    // Update tracker with new SwiftF0 result.
+    // Returns 14-bit bend value (0–16383) to send, or -1 if no bend should be sent.
+    // activeMidiNote: the MIDI note currently playing
+    // medianHz:       SwiftF0 median Hz for this cycle (-1 if silent)
+    // maxConf:        SwiftF0 max confidence this cycle
+    // msSinceOnset:   milliseconds since last onset
+    int update(int activeMidiNote, float medianHz, float maxConf, float msSinceOnset)
+    {
+        // Gate 1: onset mask — no bend during attack transient
+        if (msSinceOnset < ONSET_MASK_MS) {
+            reset();
+            return -1;
+        }
+
+        // Gate 2: stability — need consecutive high-confidence frames
+        if (maxConf >= STABILITY_THRESH)
+            ++stableCount;
+        else
+            stableCount = 0;
+
+        if (stableCount < STABILITY_FRAMES) {
+            bendActive = false;
+            return -1;
+        }
+        bendActive = true;
+
+        // No Hz data or no active note → send center
+        if (medianHz <= 0.0f || activeMidiNote < 0)
+            return (lastBendValue != 8192) ? (lastBendValue = 8192) : -1;
+
+        // Compute cent deviation from MIDI note center
+        const float centerHz = 440.0f * std::pow(2.0f, (activeMidiNote - 69) / 12.0f);
+        const float centDiff = 1200.0f * std::log2(medianHz / centerHz);
+
+        // Gate 3: dead zone — keep perfectly in tune
+        if (std::fabs(centDiff) < DEAD_ZONE_CENTS) {
+            if (lastBendValue != 8192) { lastBendValue = 8192; return 8192; }
+            return -1;  // already at center, no need to re-send
+        }
+
+        // Gate 4: beyond max bend → don't bend (let note-change logic handle it)
+        if (std::fabs(centDiff) > MAX_BEND_CENTS) return -1;
+
+        // Map cents to 14-bit MIDI pitch bend (8192 = center)
+        int bendVal = 8192 + static_cast<int>((centDiff / BEND_RANGE_CENTS) * 8191.0f);
+        bendVal = std::clamp(bendVal, 0, 16383);
+
+        if (bendVal == lastBendValue) return -1;  // no change
+        lastBendValue = bendVal;
+        return bendVal;
+    }
+};
+
 // ── MIDI output queue ─────────────────────────────────────────────────────────
 
 static constexpr int MIDI_QUEUE_CAP = 64; // events between audio callbacks; 64 is ample
 
 // ── Pending MIDI event ────────────────────────────────────────────────────────
-// velocity: 0–127.  LV2 consumer casts to uint8_t; synth consumer divides by 127.f.
+// type: NOTE_ON, NOTE_OFF, or PITCH_BEND.
+// For NOTE_ON/OFF: pitch = MIDI note, value = velocity (0–127).
+// For PITCH_BEND:  pitch = unused, value = 14-bit bend (0–16383, center=8192).
 
-struct PendingNote { bool noteOn; int pitch; int velocity; };
+struct PendingNote {
+    enum Type : uint8_t { NOTE_ON, NOTE_OFF, PITCH_BEND } type;
+    int pitch;
+    int value;
+
+    // Convenience constructors for backward compatibility
+    PendingNote() = default;
+    PendingNote(bool noteOn, int p, int v)
+        : type(noteOn ? NOTE_ON : NOTE_OFF), pitch(p), value(v) {}
+    static PendingNote bend(int bendValue)
+        { PendingNote e; e.type = PITCH_BEND; e.pitch = 0; e.value = bendValue; return e; }
+};
 
 // ── Lockless SPSC MIDI output queue (worker → audio thread) ──────────────────
 // Standard single-producer / single-consumer ring buffer.
@@ -271,6 +361,9 @@ struct RangeStateBase {
     // Reset only by a tier-1 PICK onset (high-confidence new attack).
     int                 provCooldownRemain = 0;    // samples remaining
     int                 provCooldownNote   = -1;   // MIDI note under cooldown
+
+    // Pitch bend tracker (worker-only, swiftmono)
+    PitchBendTracker    bendTracker;
 
 #ifdef PIPITCH_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
@@ -732,6 +825,8 @@ static void runWorkerCommon(Hooks& h)
             uint64_t    newBits   = 0;
             int8_t      newVel[NOTE_COUNT] = {};
             double      inferMs   = 0.0;
+            float       sf0Hz     = -1.0f;   // SwiftF0 median Hz (for pitch bend)
+            float       sf0MaxConf = 0.0f;   // SwiftF0 max confidence (for bend gate)
             const char* modeLabel = "CNN";
 
             if (swiftMono) {
@@ -758,7 +853,8 @@ static void runWorkerCommon(Hooks& h)
 
                 const auto t0 = std::chrono::steady_clock::now();
                 const int midiNote = h.swiftF0()->infer(
-                    sf0Buf.data(), dstLen, h.swiftThreshold());
+                    sf0Buf.data(), dstLen, h.swiftThreshold(),
+                    &sf0Hz, &sf0MaxConf);
                 inferMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
 
@@ -1084,6 +1180,30 @@ static void runWorkerCommon(Hooks& h)
 
             // Notes changed hook (ON/OFF logging)
             h.onNotesChanged(r, prevActive, newVel, inferMs, modeLabel);
+
+            // Pitch bend (swiftMono only, when bend is enabled).
+            // Run after applyNotesDiff so we know the active note.
+            // Reset tracker on note changes; update on sustained notes.
+            if (swiftMono && h.bendEnabled() && r.activeNotes) {
+                const int activeNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
+                // Reset on note change
+                if (r.activeNotes != prevActive) r.bendTracker.reset();
+                // Compute ms since last onset
+                const uint64_t elSamples =
+                    h.totalSamples() - h.lastOnsetSample();
+                const float msSinceOnset = static_cast<float>(
+                    elSamples * 1000.0 / h.sampleRate());
+                const int bendVal = r.bendTracker.update(
+                    activeNote, sf0Hz, sf0MaxConf, msSinceOnset);
+                if (bendVal >= 0)
+                    r.midiOut.push(PendingNote::bend(bendVal));
+            } else if (swiftMono && !r.activeNotes) {
+                // No active note → reset and send center if bend was active
+                if (r.bendTracker.bendActive) {
+                    r.midiOut.push(PendingNote::bend(8192));
+                    r.bendTracker.reset();
+                }
+            }
 
             // Mono cross-range: new note-ON(s) → kill all other ranges.
             // In swiftMono, defer to end-of-cycle priority resolution (below)
