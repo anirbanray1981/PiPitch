@@ -938,56 +938,51 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     // ── GoertzelPoly: sample-by-sample in audio thread (AArch64 only) ───
 #ifdef __aarch64__
     if (m->mode == PlayMode::GOERTZEL_POLY && !gated) {
-        for (jack_nframes_t i = 0; i < nFrames; ++i)
-            m->goertzel.processSample(in[i]);
+        m->goertzel.processBlock(in, static_cast<int>(nFrames));
 
         const float transRatio = (m->pickFiredRemain > 0) ? 10.0f : 1.0f;
-        const float onThresh  = m->gateFloor * 100.0f;
-        const float offThresh = onThresh * 0.3f;
+        const float onThresh  = 0.08f;    // calibrated for decayed Goertzel magnitudes
+        const float offThresh = 0.02f;    // hysteresis
         m->goertzel.update(transRatio, onThresh, offThresh);
 
-        uint64_t newBits = 0;
-        const auto& states = m->goertzel.getNoteStates();
+        // Check note states using triggerPending (fire-once per onset)
+        auto& states = m->goertzel.getNoteStates();
         const int gStart = m->goertzel.startMidi();
-        for (int i = 0; i < m->goertzel.numNotes(); ++i) {
-            if (states[i].isActive) {
-                const int midi = gStart + i;
-                if (midi >= NOTE_BASE && midi < NOTE_BASE + NOTE_COUNT)
-                    newBits |= (1ULL << (midi - NOTE_BASE));
-            }
-        }
-
-        const uint64_t prevBits = m->goertzelPrevBits;
-        const uint64_t noteOns  = newBits & ~prevBits;
-        const uint64_t noteOffs = prevBits & ~newBits;
         const double elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - m->startTime).count();
+        bool flushed = false;
 
-        for (uint64_t tmp = noteOffs; tmp; tmp &= tmp - 1) {
-            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
-            std::printf("[+%.3fs]  OFF  %-4s (%3d)  [Goertzel]\n",
-                        elapsed, midiToName(p).c_str(), p);
-            for (auto& v : m->voices)
-                if (v.pitch == p && v.state != 0) v.state = 3;
-        }
-        for (uint64_t tmp = noteOns; tmp; tmp &= tmp - 1) {
-            const int bit = __builtin_ctzll(tmp);
-            const int p   = NOTE_BASE + bit;
-            const int idx = p - gStart;
-            const int vel = (idx >= 0 && idx < m->goertzel.numNotes())
-                            ? states[idx].velocity : 100;
-            std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d  [Goertzel]\n",
-                        elapsed, midiToName(p).c_str(), p, vel, elapsed);
-            int best = 0;
-            float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
-            for (int i = 0; i < MAX_VOICES; ++i) {
-                if (m->voices[i].state == 0) { best = i; break; }
-                if (m->voices[i].envLevel < bestLevel) { bestLevel = m->voices[i].envLevel; best = i; }
+        for (int i = 0; i < m->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            auto& s = states[i];
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+
+            if (s.isActive && !(m->goertzelPrevBits & bit)) {
+                if (s.triggerPending) {
+                    std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d  [Goertzel]\n",
+                                elapsed, midiToName(midi).c_str(), midi, s.velocity);
+                    int best = 0;
+                    float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+                    for (int v = 0; v < MAX_VOICES; ++v) {
+                        if (m->voices[v].state == 0) { best = v; break; }
+                        if (m->voices[v].envLevel < bestLevel) { bestLevel = m->voices[v].envLevel; best = v; }
+                    }
+                    m->voices[best] = { midi, midiToFreq(midi), 0.0, s.velocity / 127.0f, 1, 0.0f };
+                    s.triggerPending = false;
+                    m->goertzelPrevBits |= bit;
+                    flushed = true;
+                }
+            } else if (!s.isActive && (m->goertzelPrevBits & bit)) {
+                std::printf("[+%.3fs]  OFF  %-4s (%3d)  [Goertzel]\n",
+                            elapsed, midiToName(midi).c_str(), midi);
+                for (auto& v : m->voices)
+                    if (v.pitch == midi && v.state != 0) v.state = 3;
+                m->goertzelPrevBits &= ~bit;
+                flushed = true;
             }
-            m->voices[best] = { p, midiToFreq(p), 0.0, vel / 127.0f, 1, 0.0f };
         }
-        if (noteOns || noteOffs) std::fflush(stdout);
-        m->goertzelPrevBits = newBits;
+        if (flushed) std::fflush(stdout);
     } else if (m->mode == PlayMode::GOERTZEL_POLY && gated) {
         for (uint64_t tmp = m->goertzelPrevBits; tmp; tmp &= tmp - 1) {
             const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));

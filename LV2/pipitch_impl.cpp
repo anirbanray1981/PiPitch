@@ -774,48 +774,40 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     // Only available on AArch64 (Pi 5) — requires NEON SIMD.
 #ifdef __aarch64__
     if (self->modeVal.load(std::memory_order_relaxed) == 4 && !gated) {
-        // Feed all samples to Goertzel at native sample rate
-        for (uint32_t i = 0; i < nSamples; ++i)
-            self->goertzel.processSample(self->audioIn[i]);
+        // Feed windowed audio block to Goertzel
+        self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples));
 
         // Compute magnitudes and update note states
         const float transRatio = (self->pickFiredRemain > 0) ? 10.0f : 1.0f;
-        const float onThresh  = *self->gate * 100.0f;  // scale gate_floor
-        const float offThresh = onThresh * 0.3f;       // hysteresis
+        const float onThresh  = 0.08f;    // calibrated for decayed Goertzel magnitudes
+        const float offThresh = 0.02f;    // hysteresis
         self->goertzel.update(transRatio, onThresh, offThresh);
 
-        // Build bitmap from Goertzel note states
-        uint64_t newBits = 0;
-        const auto& states = self->goertzel.getNoteStates();
+        // Check note states using triggerPending (fire-once per onset)
+        auto& states = self->goertzel.getNoteStates();
         const int gStart = self->goertzel.startMidi();
         for (int i = 0; i < self->goertzel.numNotes(); ++i) {
-            if (states[i].isActive) {
-                const int midi = gStart + i;
-                if (midi >= NOTE_BASE && midi < NOTE_BASE + NOTE_COUNT)
-                    newBits |= (1ULL << (midi - NOTE_BASE));
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            auto& s = states[i];
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+
+            if (s.isActive && !(self->goertzelPrevBits & bit)) {
+                // New note-ON: only fire if triggerPending (prevents re-trigger)
+                if (s.triggerPending) {
+                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                              0x90, static_cast<uint8_t>(midi),
+                              static_cast<uint8_t>(s.velocity));
+                    s.triggerPending = false;  // consume
+                    self->goertzelPrevBits |= bit;
+                }
+            } else if (!s.isActive && (self->goertzelPrevBits & bit)) {
+                // Note-OFF
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          0x80, static_cast<uint8_t>(midi), uint8_t(0));
+                self->goertzelPrevBits &= ~bit;
             }
         }
-
-        // Diff against previous state → send MIDI ON/OFF
-        const uint64_t prevBits = self->goertzelPrevBits;
-        const uint64_t noteOns  = newBits & ~prevBits;
-        const uint64_t noteOffs = prevBits & ~newBits;
-
-        for (uint64_t tmp = noteOffs; tmp; tmp &= tmp - 1) {
-            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
-            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                      0x80, static_cast<uint8_t>(p), uint8_t(0));
-        }
-        for (uint64_t tmp = noteOns; tmp; tmp &= tmp - 1) {
-            const int bit = __builtin_ctzll(tmp);
-            const int p   = NOTE_BASE + bit;
-            const int idx = p - gStart;
-            const int vel = (idx >= 0 && idx < self->goertzel.numNotes())
-                            ? states[idx].velocity : 100;
-            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                      0x90, static_cast<uint8_t>(p), static_cast<uint8_t>(vel));
-        }
-        self->goertzelPrevBits = newBits;
     } else if (self->modeVal.load(std::memory_order_relaxed) == 4 && gated) {
         // Gated: turn off all active Goertzel notes
         for (uint64_t tmp = self->goertzelPrevBits; tmp; tmp &= tmp - 1) {
