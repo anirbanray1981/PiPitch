@@ -367,6 +367,13 @@ struct RangeStateBase {
     int                 provBentTo     = -1;   // if >=0, provisional was bend-snapped to this MIDI note
     bool                provNeedsBoost = false; // muted provisional awaiting velocity boost from SwiftF0
 
+    // Note lock (worker-only, swiftmono): once SwiftF0 confirms a note,
+    // lock it until the next onset.  Prevents SwiftF0 oscillation (e.g.
+    // E4→silent→E4) from causing audible dropouts.
+    int                 lockedNote     = -1;   // MIDI note locked by SwiftF0 confirmation
+    bool                lockArmed      = false; // true after first SwiftF0 confirmation
+    int                 lockTTL        = 0;    // cycles remaining before lock expires
+
 #ifdef PIPITCH_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
 #endif
@@ -711,7 +718,17 @@ static void applyNotesDiff(RangeStateBase& r, uint64_t newBits,
     // Active notes absent from newBits → start hold or OFF immediately.
     // In mono mode: bypass hold when new notes are appearing (immediate swap).
     // monoSwap: immediate OFF for vanishing notes when new notes appear.
+    // Send MIDI OFF for held notes so they don't ring in the synth.
     const bool monoSwap = mono && (newBits & ~r.activeNotes);
+    if (monoSwap) {
+        for (uint64_t tmp = r.holdNotes & ~newBits; tmp; tmp &= tmp - 1) {
+            const int bit = __builtin_ctzll(tmp);
+            r.midiOut.push({false, NOTE_BASE + bit, 0});
+            r.activeNotes &= ~(1ULL << bit);
+            r.holdNotes   &= ~(1ULL << bit);
+            r.holdCounts[bit] = 0;
+        }
+    }
     for (uint64_t tmp = r.activeNotes & ~newBits & ~r.holdNotes; tmp; tmp &= tmp - 1) {
         const int  bit          = __builtin_ctzll(tmp);
         const bool cancelledProv = (prov != -1 && (NOTE_BASE + bit) == prov
@@ -817,6 +834,11 @@ static void runWorkerCommon(Hooks& h)
                             r.swiftPolyKeepBits  |= (1ULL << bit);
                             r.swiftPolyKeepAge[bit] = SWIFT_POLY_KEEPALIVE;
                             r.activeNotes |= (1ULL << bit);
+                        } else if (swiftMono) {
+                            // SwiftMono: don't promote to activeNotes here.
+                            // Let applyNotesDiff handle it so monoSwap detects
+                            // the note as "new" and immediately kills the old note.
+                            provForDiff = snapProv;
                         } else {
                             r.activeNotes |= (1ULL << (snapProv - NOTE_BASE));
                             provForDiff = snapProv;
@@ -868,6 +890,42 @@ static void runWorkerCommon(Hooks& h)
                     const int bit = midiNote - NOTE_BASE;
                     newBits    = 1ULL << bit;
                     newVel[bit] = 100;
+                }
+
+                // Note lock: once SwiftF0 confirms a note, lock it until the
+                // next onset or a new provisional.  Prevents SwiftF0 oscillation
+                // (E4→silent→E4 or E4→D4→E4) from causing audible dropouts.
+                {
+                    // Release lock on onset, new provisional, or TTL expiry
+                    const int curProv = r.provNote.load(std::memory_order_acquire);
+                    const bool newProv = (curProv != -1 && curProv != r.lockedNote);
+                    if (wasOnset || newProv) {
+                        r.lockedNote = -1;
+                        r.lockArmed = false;
+                        r.lockTTL = 0;
+                    }
+                    // Decrement TTL — lock expires after N cycles regardless
+                    if (r.lockArmed && --r.lockTTL <= 0) {
+                        r.lockedNote = -1;
+                        r.lockArmed = false;
+                    }
+                }
+                if (r.lockArmed && r.lockedNote >= 0) {
+                    const int lockBit = r.lockedNote - NOTE_BASE;
+                    // Refresh TTL if SwiftF0 detected the locked note (before override)
+                    if (lockBit >= 0 && lockBit < NOTE_COUNT && (newBits & (1ULL << lockBit)))
+                        r.lockTTL = r.cfg.swiftHoldCycles * 2;
+                    // Lock active: force newBits to locked note
+                    if (lockBit >= 0 && lockBit < NOTE_COUNT) {
+                        newBits = 1ULL << lockBit;
+                        newVel[lockBit] = 100;
+                    }
+                } else if (!r.lockArmed && newBits && r.activeNotes
+                           && newBits == r.activeNotes) {
+                    // SwiftF0 agrees with active note → arm the lock
+                    r.lockedNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
+                    r.lockArmed = true;
+                    r.lockTTL = r.cfg.swiftHoldCycles * 2;
                 }
 
                 // From-silence onset grace: suppresses stale ring detections
@@ -1260,15 +1318,26 @@ static void runWorkerCommon(Hooks& h)
                 const int activeNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
                 // Reset on note change
                 if (r.activeNotes != prevActive) r.bendTracker.reset();
-                // Compute ms since last onset
-                const uint64_t elSamples =
-                    h.totalSamples() - h.lastOnsetSample();
-                const float msSinceOnset = static_cast<float>(
-                    elSamples * 1000.0 / h.sampleRate());
-                const int bendVal = r.bendTracker.update(
-                    activeNote, sf0Hz, sf0MaxConf, msSinceOnset);
-                if (bendVal >= 0)
-                    r.midiOut.push(PendingNote::bend(bendVal));
+                // Only track bend when SwiftF0 detects the same MIDI note.
+                // If silent or drifting to a different note (decay), snap to center
+                // to prevent the pitch from dropping audibly at end of note.
+                const int sf0Midi = (sf0Hz > 20.0f)
+                    ? static_cast<int>(std::round(69.0f + 12.0f * std::log2(sf0Hz / 440.0f)))
+                    : -1;
+                if (sf0Midi == activeNote) {
+                    const uint64_t elSamples =
+                        h.totalSamples() - h.lastOnsetSample();
+                    const float msSinceOnset = static_cast<float>(
+                        elSamples * 1000.0 / h.sampleRate());
+                    const int bendVal = r.bendTracker.update(
+                        activeNote, sf0Hz, sf0MaxConf, msSinceOnset);
+                    if (bendVal >= 0)
+                        r.midiOut.push(PendingNote::bend(bendVal));
+                } else if (r.bendTracker.bendActive) {
+                    // SwiftF0 silent or drifted — snap to center
+                    r.midiOut.push(PendingNote::bend(8192));
+                    r.bendTracker.reset();
+                }
             } else if (swiftMono && !r.activeNotes) {
                 // No active note → reset and send center if bend was active
                 if (r.bendTracker.bendActive) {
