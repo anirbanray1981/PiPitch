@@ -31,6 +31,9 @@
 #include "BasicPitch.h"
 #include "NoteRangeConfig.h"
 #include "OneBitPitchDetector.h"
+#ifdef __aarch64__
+#include "UltraLowLatencyGoertzel.h"
+#endif
 #ifdef PIPITCH_ENABLE_MPM
 #  include "McLeodPitchDetector.h"
 #endif
@@ -364,6 +367,8 @@ struct RangeStateBase {
     // Reset only by a tier-1 PICK onset (high-confidence new attack).
     int                 provCooldownRemain = 0;    // samples remaining
     int                 provCooldownNote   = -1;   // MIDI note under cooldown
+
+    // (GoertzelPoly uses UltraLowLatencyGoertzel on plugin/monitor level, not per-range)
 
     // Pitch bend tracker (worker-only, swiftmono)
     PitchBendTracker    bendTracker;
@@ -808,10 +813,11 @@ static void runWorkerCommon(Hooks& h)
 
         const float ampFloor  = h.ampFloor();
         const int   modeNow   = h.mode();
-        const bool  swiftMono = (modeNow == 2 && h.swiftF0() != nullptr);
-        const int   provMode  = h.provisionalMode();
-        const bool  swiftPoly = (modeNow == 3 && h.swiftF0() != nullptr && provMode != 2);
-        const bool  mono      = (modeNow == 1 || modeNow == 2);
+        const bool  swiftMono    = (modeNow == 2 && h.swiftF0() != nullptr);
+        const int   provMode    = h.provisionalMode();
+        const bool  swiftPoly   = (modeNow == 3 && h.swiftF0() != nullptr && provMode != 2);
+        const bool  goertzelPoly = (modeNow == 4);
+        const bool  mono        = (modeNow == 1 || modeNow == 2);
 
         auto& ranges = h.ranges();
         for (int ri = 0; ri < static_cast<int>(ranges.size()); ++ri) {
@@ -1192,6 +1198,12 @@ static void runWorkerCommon(Hooks& h)
                 const int effNote = swiftBits
                     ? NOTE_BASE + static_cast<int>(__builtin_ctzll(swiftBits)) : -1;
                 h.onSwiftPolyResult(r, effNote, sf0Ms, cnnBits, cnnMs);
+
+            } else if (goertzelPoly) {
+                // GoertzelPoly runs in the audio thread (zero-latency).
+                // Skip worker processing — just release the snapshot slot.
+                r.snapChan.ready.store(false, std::memory_order_release);
+                continue;  // nothing for the worker to do
 
             } else {
                 // ── BasicPitch (CNN) path ────────────────────────────────────

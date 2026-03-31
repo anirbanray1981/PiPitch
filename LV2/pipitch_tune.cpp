@@ -163,6 +163,10 @@ struct Monitor {
     std::array<int, 8> onsetProvNotes = {-1,-1,-1,-1,-1,-1,-1,-1};
 
     std::unique_ptr<SwiftF0Detector> swiftF0;         // null if model not found
+#ifdef __aarch64__
+    UltraLowLatencyGoertzel          goertzel;        // GoertzelPoly mode
+    uint64_t goertzelPrevBits = 0;
+#endif
     float                            swiftF0Threshold = 0.5f;
     std::vector<float>               sf0Buf;          // worker-thread scratch: 16 kHz audio
 
@@ -931,6 +935,70 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         dispatchSnapshotIfReady(r, onsetFired, r.provOnTimeMs, m->workerSem, m->gateFloor);
     }
 
+    // ── GoertzelPoly: sample-by-sample in audio thread (AArch64 only) ───
+#ifdef __aarch64__
+    if (m->mode == PlayMode::GOERTZEL_POLY && !gated) {
+        for (jack_nframes_t i = 0; i < nFrames; ++i)
+            m->goertzel.processSample(in[i]);
+
+        const float transRatio = (m->pickFiredRemain > 0) ? 10.0f : 1.0f;
+        const float onThresh  = m->gateFloor * 100.0f;
+        const float offThresh = onThresh * 0.3f;
+        m->goertzel.update(transRatio, onThresh, offThresh);
+
+        uint64_t newBits = 0;
+        const auto& states = m->goertzel.getNoteStates();
+        const int gStart = m->goertzel.startMidi();
+        for (int i = 0; i < m->goertzel.numNotes(); ++i) {
+            if (states[i].isActive) {
+                const int midi = gStart + i;
+                if (midi >= NOTE_BASE && midi < NOTE_BASE + NOTE_COUNT)
+                    newBits |= (1ULL << (midi - NOTE_BASE));
+            }
+        }
+
+        const uint64_t prevBits = m->goertzelPrevBits;
+        const uint64_t noteOns  = newBits & ~prevBits;
+        const uint64_t noteOffs = prevBits & ~newBits;
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m->startTime).count();
+
+        for (uint64_t tmp = noteOffs; tmp; tmp &= tmp - 1) {
+            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+            std::printf("[+%.3fs]  OFF  %-4s (%3d)  [Goertzel]\n",
+                        elapsed, midiToName(p).c_str(), p);
+            for (auto& v : m->voices)
+                if (v.pitch == p && v.state != 0) v.state = 3;
+        }
+        for (uint64_t tmp = noteOns; tmp; tmp &= tmp - 1) {
+            const int bit = __builtin_ctzll(tmp);
+            const int p   = NOTE_BASE + bit;
+            const int idx = p - gStart;
+            const int vel = (idx >= 0 && idx < m->goertzel.numNotes())
+                            ? states[idx].velocity : 100;
+            std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d  [Goertzel]\n",
+                        elapsed, midiToName(p).c_str(), p, vel, elapsed);
+            int best = 0;
+            float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+            for (int i = 0; i < MAX_VOICES; ++i) {
+                if (m->voices[i].state == 0) { best = i; break; }
+                if (m->voices[i].envLevel < bestLevel) { bestLevel = m->voices[i].envLevel; best = i; }
+            }
+            m->voices[best] = { p, midiToFreq(p), 0.0, vel / 127.0f, 1, 0.0f };
+        }
+        if (noteOns || noteOffs) std::fflush(stdout);
+        m->goertzelPrevBits = newBits;
+    } else if (m->mode == PlayMode::GOERTZEL_POLY && gated) {
+        for (uint64_t tmp = m->goertzelPrevBits; tmp; tmp &= tmp - 1) {
+            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+            for (auto& v : m->voices)
+                if (v.pitch == p && v.state != 0) v.state = 3;
+        }
+        m->goertzelPrevBits = 0;
+        m->goertzel.reset();
+    }
+#endif // __aarch64__
+
     processSynth(m, out, static_cast<int>(nFrames));
     return 0;
 }
@@ -974,8 +1042,9 @@ int main(int argc, char** argv)
             const char* s = argv[++i];
             if      (!std::strcmp(s, "mono"))      mode = PlayMode::MONO;
             else if (!std::strcmp(s, "swiftmono")) mode = PlayMode::SWIFT_MONO;
-            else if (!std::strcmp(s, "swiftpoly")) mode = PlayMode::SWIFT_POLY;
-            else                                   mode = PlayMode::POLY;
+            else if (!std::strcmp(s, "swiftpoly"))    mode = PlayMode::SWIFT_POLY;
+            else if (!std::strcmp(s, "goertzelpoly")) mode = PlayMode::GOERTZEL_POLY;
+            else                                      mode = PlayMode::POLY;
             modeSet = true;
         }
         else if (!std::strcmp(argv[i], "--provisional")      && i+1 < argc) {
@@ -1083,7 +1152,8 @@ int main(int argc, char** argv)
     std::printf("Mode:       %s\n",
                 rangeCfg.mode == PlayMode::MONO       ? "mono" :
                 rangeCfg.mode == PlayMode::SWIFT_MONO ? "swiftmono" :
-                rangeCfg.mode == PlayMode::SWIFT_POLY ? "swiftpoly" : "poly");
+                rangeCfg.mode == PlayMode::SWIFT_POLY    ? "swiftpoly" :
+                rangeCfg.mode == PlayMode::GOERTZEL_POLY ? "goertzelpoly" : "poly");
     if (rangeCfg.mode == PlayMode::SWIFT_MONO || rangeCfg.mode == PlayMode::SWIFT_POLY)
         std::printf("SwiftThr:   %.2f\n", rangeCfg.swiftF0Threshold);
     std::printf("Provisional:%s\n",
@@ -1177,6 +1247,9 @@ int main(int argc, char** argv)
 
     // Configure HPF pick detector.
     mon.pickDetector.init(static_cast<float>(mon.sampleRate), 3000.0f, 3.0f);
+#ifdef __aarch64__
+    mon.goertzel.init(static_cast<float>(mon.sampleRate), NOTE_BASE, NOTE_BASE + NOTE_COUNT - 1);
+#endif
 
     // Configure per-range OBP lowpass and MPM (both need sample rate).
     for (auto& rp : mon.ranges) {

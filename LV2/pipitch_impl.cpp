@@ -138,6 +138,10 @@ struct PiPitchPlugin {
     float              octaveLockMsVal = 250.0f;  // from config (not an LV2 port)
 
     std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
+#ifdef __aarch64__
+    UltraLowLatencyGoertzel          goertzel; // GoertzelPoly mode (audio-thread, zero-latency)
+    uint64_t goertzelPrevBits = 0;
+#endif
     std::vector<float>               sf0Buf;   // worker-thread scratch: 16 kHz resampled audio
 
     std::vector<std::unique_ptr<RangeState>> ranges;
@@ -332,6 +336,9 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     }
 
     self->pickDetector.init(static_cast<float>(rate), 3000.0f, 3.0f);
+#ifdef __aarch64__
+    self->goertzel.init(static_cast<float>(rate), NOTE_BASE, NOTE_BASE + NOTE_COUNT - 1);
+#endif
 
     sem_init(&self->workerSem, 0, 0);
     self->workerThread = std::thread(runWorker, self);
@@ -762,6 +769,64 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         // Dispatch snapshot: linearise ring → snapshot slot, wake worker.
         dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem, gateFloor);
     }
+
+    // ── GoertzelPoly: sample-by-sample processing in audio thread ──────────
+    // Only available on AArch64 (Pi 5) — requires NEON SIMD.
+#ifdef __aarch64__
+    if (self->modeVal.load(std::memory_order_relaxed) == 4 && !gated) {
+        // Feed all samples to Goertzel at native sample rate
+        for (uint32_t i = 0; i < nSamples; ++i)
+            self->goertzel.processSample(self->audioIn[i]);
+
+        // Compute magnitudes and update note states
+        const float transRatio = (self->pickFiredRemain > 0) ? 10.0f : 1.0f;
+        const float onThresh  = *self->gate * 100.0f;  // scale gate_floor
+        const float offThresh = onThresh * 0.3f;       // hysteresis
+        self->goertzel.update(transRatio, onThresh, offThresh);
+
+        // Build bitmap from Goertzel note states
+        uint64_t newBits = 0;
+        const auto& states = self->goertzel.getNoteStates();
+        const int gStart = self->goertzel.startMidi();
+        for (int i = 0; i < self->goertzel.numNotes(); ++i) {
+            if (states[i].isActive) {
+                const int midi = gStart + i;
+                if (midi >= NOTE_BASE && midi < NOTE_BASE + NOTE_COUNT)
+                    newBits |= (1ULL << (midi - NOTE_BASE));
+            }
+        }
+
+        // Diff against previous state → send MIDI ON/OFF
+        const uint64_t prevBits = self->goertzelPrevBits;
+        const uint64_t noteOns  = newBits & ~prevBits;
+        const uint64_t noteOffs = prevBits & ~newBits;
+
+        for (uint64_t tmp = noteOffs; tmp; tmp &= tmp - 1) {
+            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                      0x80, static_cast<uint8_t>(p), uint8_t(0));
+        }
+        for (uint64_t tmp = noteOns; tmp; tmp &= tmp - 1) {
+            const int bit = __builtin_ctzll(tmp);
+            const int p   = NOTE_BASE + bit;
+            const int idx = p - gStart;
+            const int vel = (idx >= 0 && idx < self->goertzel.numNotes())
+                            ? states[idx].velocity : 100;
+            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                      0x90, static_cast<uint8_t>(p), static_cast<uint8_t>(vel));
+        }
+        self->goertzelPrevBits = newBits;
+    } else if (self->modeVal.load(std::memory_order_relaxed) == 4 && gated) {
+        // Gated: turn off all active Goertzel notes
+        for (uint64_t tmp = self->goertzelPrevBits; tmp; tmp &= tmp - 1) {
+            const int p = NOTE_BASE + static_cast<int>(__builtin_ctzll(tmp));
+            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                      0x80, static_cast<uint8_t>(p), uint8_t(0));
+        }
+        self->goertzelPrevBits = 0;
+        self->goertzel.reset();
+    }
+#endif // __aarch64__
 
     // Second drain: catch any CNN events the worker pushed during this callback.
     // The first drain (top of run) caught events from before this cycle;

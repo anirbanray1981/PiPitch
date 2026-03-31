@@ -41,7 +41,7 @@
 #include <string>
 #include <vector>
 
-enum class PlayMode { POLY, MONO, SWIFT_MONO, SWIFT_POLY };
+enum class PlayMode { POLY, MONO, SWIFT_MONO, SWIFT_POLY, GOERTZEL_POLY };
 enum class ProvMode { ON = 0, SWIFT = 1, NONE = 2, ADAPTIVE = 3 };
 
 struct NoteRange {
@@ -120,10 +120,11 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
         if (key == "onset_blank_ms")  { cfg.onsetBlankMs     = std::stof(val); continue; }
         if (key == "swift_threshold") { cfg.swiftF0Threshold = std::stof(val); continue; }
         if (key == "mode") {
-            if      (val == "mono")      cfg.mode = PlayMode::MONO;
-            else if (val == "swiftmono") cfg.mode = PlayMode::SWIFT_MONO;
-            else if (val == "swiftpoly") cfg.mode = PlayMode::SWIFT_POLY;
-            else                         cfg.mode = PlayMode::POLY;
+            if      (val == "mono")         cfg.mode = PlayMode::MONO;
+            else if (val == "swiftmono")  cfg.mode = PlayMode::SWIFT_MONO;
+            else if (val == "swiftpoly")  cfg.mode = PlayMode::SWIFT_POLY;
+            else if (val == "goertzelpoly") cfg.mode = PlayMode::GOERTZEL_POLY;
+            else                          cfg.mode = PlayMode::POLY;
             continue;
         }
         if (key == "octave_lock_ms")  { cfg.octaveLockMs    = std::stof(val); continue; }
