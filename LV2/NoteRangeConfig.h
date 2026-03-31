@@ -42,7 +42,7 @@
 #include <vector>
 
 enum class PlayMode { POLY, MONO, SWIFT_MONO, SWIFT_POLY };
-enum class ProvMode { ON = 0, SWIFT = 1, NONE = 2 };
+enum class ProvMode { ON = 0, SWIFT = 1, NONE = 2, ADAPTIVE = 3 };
 
 struct NoteRange {
     std::string name         = "default";
@@ -65,6 +65,7 @@ struct RangeConfig {
     float     octaveLockMs      = 250.0f;  // suppress ±12/24 semitone jumps in swiftmono (0=off)
     PlayMode  mode              = PlayMode::MONO;
     ProvMode  provisionalMode  = ProvMode::ON;
+    bool      bendEnabled      = false;  // 14-bit MIDI pitch bend (swiftmono only)
 };
 
 // Return the first range whose [midiLow, midiHigh] contains pitch, or nullptr.
@@ -126,8 +127,13 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
             continue;
         }
         if (key == "octave_lock_ms")  { cfg.octaveLockMs    = std::stof(val); continue; }
+        if (key == "bend") {
+            cfg.bendEnabled = (val == "on" || val == "true" || val == "1");
+            continue;
+        }
         if (key == "provisional") {
-            if      (val == "swift") cfg.provisionalMode = ProvMode::SWIFT;
+            if      (val == "swift")    cfg.provisionalMode = ProvMode::SWIFT;
+            else if (val == "adaptive") cfg.provisionalMode = ProvMode::ADAPTIVE;
             else if (val == "none" || val == "off") cfg.provisionalMode = ProvMode::NONE;
             else                     cfg.provisionalMode = ProvMode::ON;
             continue;

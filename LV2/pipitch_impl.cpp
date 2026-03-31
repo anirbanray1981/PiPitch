@@ -80,6 +80,7 @@ enum PortIndex {
     PORT_MODE            = 7,
     PORT_ONSET_BLANK_MS  = 8,
     PORT_PROVISIONAL     = 9,
+    PORT_BEND            = 10,
 };
 
 // ── Mapped URIDs ──────────────────────────────────────────────────────────────
@@ -124,6 +125,7 @@ struct PiPitchPlugin {
     const float*       modePort;
     const float*       onsetBlankMsPort;
     const float*       provisionalPort;
+    const float*       bendPort;
 
     double sampleRate;
 
@@ -132,6 +134,7 @@ struct PiPitchPlugin {
     std::atomic<float> ampFloorVal{0.65f};
     std::atomic<int>   modeVal{1};  // 0=poly, 1=mono, 2=swiftmono, 3=swiftpoly (default: mono)
     std::atomic<int>   provisionalVal{0};  // 0=on, 1=swift, 2=none
+    std::atomic<bool>  bendVal{false};
     float              octaveLockMsVal = 250.0f;  // from config (not an LV2 port)
 
     std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
@@ -178,6 +181,7 @@ struct ImplWorkerHooks {
     uint64_t            lastOnsetSample(){ return self->lastOnsetSample.load(std::memory_order_acquire); }
     int                 provisionalMode(){ return self->provisionalVal.load(std::memory_order_relaxed); }
     float               octaveLockMs()   { return self->octaveLockMsVal; }
+    bool                bendEnabled()    { return self->bendVal.load(std::memory_order_relaxed); }
     auto&               ranges()         { return self->ranges; }
 
     // No logging in LV2 plugin
@@ -352,6 +356,7 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
         case PORT_MODE:            self->modePort           = static_cast<const float*>(data);       break;
         case PORT_ONSET_BLANK_MS:  self->onsetBlankMsPort   = static_cast<const float*>(data);       break;
         case PORT_PROVISIONAL:    self->provisionalPort    = static_cast<const float*>(data);       break;
+        case PORT_BEND:           self->bendPort           = static_cast<const float*>(data);       break;
     }
 }
 
@@ -399,11 +404,19 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     // Drain all per-range MIDI output queues — lockless
     for (auto& rp : self->ranges) {
         PendingNote pn;
-        while (rp->midiOut.pop(pn))
-            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                      pn.noteOn ? uint8_t(0x90) : uint8_t(0x80),
-                      static_cast<uint8_t>(pn.pitch),
-                      pn.noteOn ? static_cast<uint8_t>(pn.velocity) : uint8_t(0));
+        while (rp->midiOut.pop(pn)) {
+            if (pn.type == PendingNote::PITCH_BEND) {
+                const uint8_t lsb = static_cast<uint8_t>(pn.value & 0x7F);
+                const uint8_t msb = static_cast<uint8_t>((pn.value >> 7) & 0x7F);
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          uint8_t(0xE0), lsb, msb);
+            } else {
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          pn.type == PendingNote::NOTE_ON ? uint8_t(0x90) : uint8_t(0x80),
+                          static_cast<uint8_t>(pn.pitch),
+                          pn.type == PendingNote::NOTE_ON ? static_cast<uint8_t>(pn.value) : uint8_t(0));
+            }
+        }
     }
 
     // Propagate LV2 port values to worker atomics every callback.
@@ -413,6 +426,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     if (self->frameThresholdPort) self->frameThresholdVal.store(*self->frameThresholdPort, std::memory_order_relaxed);
     if (self->modePort)           self->modeVal.store(static_cast<int>(*self->modePort + 0.5f), std::memory_order_relaxed);
     if (self->provisionalPort)    self->provisionalVal.store(static_cast<int>(*self->provisionalPort + 0.5f), std::memory_order_relaxed);
+    if (self->bendPort)           self->bendVal.store(*self->bendPort > 0.5f, std::memory_order_relaxed);
     if (self->ampFloor)           self->ampFloorVal.store(*self->ampFloor, std::memory_order_relaxed);
 
     if (self->audioOut)
@@ -492,7 +506,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
             // Two-phase OneBitPitch + MPM — skipped when provisional != on.
-            const bool provEnabled = (self->provisionalVal.load(std::memory_order_relaxed) == 0);
+            const int pvNow = self->provisionalVal.load(std::memory_order_relaxed);
+            const bool provEnabled = (pvNow == 0 || pvNow == 3);  // on or adaptive
             if (provEnabled) {
 
             armOrExpireOBP(r, static_cast<float>(self->sampleRate),
@@ -586,10 +601,32 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         }
                     }
                 }}
-                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                          0x90, static_cast<uint8_t>(note), uint8_t(100));
-                r.provNote.store(note, std::memory_order_release);
-                r.monoHeldNote.store(note, std::memory_order_release);
+                // Kill existing provisional in this range if different note
+                {   const int oldProv = r.provNote.load(std::memory_order_acquire);
+                    if (oldProv != -1 && oldProv != note) {
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  0x80, static_cast<uint8_t>(oldProv), uint8_t(0));
+                        // Reset pitch bend if it was snapped
+                        if (r.provBentTo >= 0) {
+                            writeMidi(&self->forge, 1, self->uris.midi_MidiEvent,
+                                      0xE0, uint8_t(0), uint8_t(0x40)); // center
+                        }
+                    }
+                }
+                const int pv = self->provisionalVal.load(std::memory_order_relaxed);
+                if (pv == 3) {
+                    // Adaptive mode: don't send MIDI ON; worker decides after SwiftF0
+                    r.provNote.store(note, std::memory_order_release);
+                    r.monoHeldNote.store(note, std::memory_order_release);
+                } else {
+                    // Normal mode: send MIDI ON at muted velocity (~30%)
+                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                              0x90, static_cast<uint8_t>(note), uint8_t(40));
+                    r.provNote.store(note, std::memory_order_release);
+                    r.monoHeldNote.store(note, std::memory_order_release);
+                }
+                r.provBentTo = -1;  // reset bend snap state
+                r.provNeedsBoost = (pv != 3);  // muted provisional needs velocity boost
                 r.provCooldownRemain = static_cast<int>(self->sampleRate * 0.2);
                 r.provCooldownNote   = note;
             };
@@ -711,11 +748,19 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     // this one reduces CNN note latency by up to one JACK buffer.
     for (auto& rp : self->ranges) {
         PendingNote pn;
-        while (rp->midiOut.pop(pn))
-            writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                      pn.noteOn ? uint8_t(0x90) : uint8_t(0x80),
-                      static_cast<uint8_t>(pn.pitch),
-                      pn.noteOn ? static_cast<uint8_t>(pn.velocity) : uint8_t(0));
+        while (rp->midiOut.pop(pn)) {
+            if (pn.type == PendingNote::PITCH_BEND) {
+                const uint8_t lsb = static_cast<uint8_t>(pn.value & 0x7F);
+                const uint8_t msb = static_cast<uint8_t>((pn.value >> 7) & 0x7F);
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          uint8_t(0xE0), lsb, msb);
+            } else {
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          pn.type == PendingNote::NOTE_ON ? uint8_t(0x90) : uint8_t(0x80),
+                          static_cast<uint8_t>(pn.pitch),
+                          pn.type == PendingNote::NOTE_ON ? static_cast<uint8_t>(pn.value) : uint8_t(0));
+            }
+        }
     }
 
     lv2_atom_forge_pop(&self->forge, &seqFrame);

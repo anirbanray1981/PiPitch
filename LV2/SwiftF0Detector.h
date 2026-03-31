@@ -40,10 +40,15 @@ public:
     // audio16k  : float32 samples at 16 kHz
     // nSamples  : sample count (must be >= 256 for at least one frame)
     // threshold : minimum confidence to accept a frame (0–1, default 0.5)
+    // outHz     : if non-null, receives the median Hz of confident frames
+    // outMaxConf: if non-null, receives the maximum confidence across all frames
     // Returns   : MIDI note (integer, rounded) of the median confident frame,
     //             or -1 if no frame passes the threshold.
-    int infer(const float* audio16k, int nSamples, float threshold = 0.5f)
+    int infer(const float* audio16k, int nSamples, float threshold = 0.5f,
+              float* outHz = nullptr, float* outMaxConf = nullptr)
     {
+        if (outHz)      *outHz = -1.0f;
+        if (outMaxConf) *outMaxConf = 0.0f;
         if (nSamples < 256) return -1;
 
         const int64_t n = static_cast<int64_t>(nSamples);
@@ -72,6 +77,12 @@ public:
             shape.size() >= 2 ? shape[1] : (shape.empty() ? 0 : shape[0]));
         if (nFrames <= 0) return -1;
 
+        // Track max confidence across all frames (for pitch bend stability gate).
+        float maxConf = 0.0f;
+        for (int i = 0; i < nFrames; ++i)
+            if (conf[i] > maxConf) maxConf = conf[i];
+        if (outMaxConf) *outMaxConf = maxConf;
+
         // Collect pitches from frames whose confidence exceeds the threshold.
         hz_.clear();
         for (int i = 0; i < nFrames; ++i)
@@ -83,6 +94,7 @@ public:
         // Median pitch avoids outlier frames pulling the result sharp or flat.
         std::sort(hz_.begin(), hz_.end());
         const float medHz = hz_[hz_.size() / 2];
+        if (outHz) *outHz = medHz;
 
         // Hz → MIDI (equal temperament, A4 = 440 Hz = MIDI 69)
         const float midi = 69.0f + 12.0f * std::log2(medHz / 440.0f);
