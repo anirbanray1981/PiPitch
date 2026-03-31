@@ -202,6 +202,41 @@ if(BUILD_LV2)
         message(STATUS "LV2: pipitch_tune target enabled")
     endif()
 
+    option(BUILD_LV2_TEST "Build the record/test regression tool (requires JACK)" ON)
+    if(BUILD_LV2_TEST)
+        if(NOT JACK_LIB)
+            find_library(JACK_LIB jack REQUIRED)
+        endif()
+        add_executable(pipitch_test
+            ${CMAKE_SOURCE_DIR}/LV2/pipitch_test.cpp
+            ${LIB_MODEL_SOURCES}
+        )
+        target_compile_features(pipitch_test PRIVATE cxx_std_17)
+        target_compile_options(pipitch_test PRIVATE -O2 -fPIC)
+        target_include_directories(pipitch_test PRIVATE
+            ${CMAKE_SOURCE_DIR}/LV2
+            ${NN}/Lib/Model
+            ${NN}/Lib/Utils
+            ${NN}/ThirdParty/RTNeural
+            ${NN}/ThirdParty/onnxruntime/include
+        )
+        target_compile_definitions(pipitch_test PRIVATE
+            SAVE_DOWNSAMPLED_AUDIO=0
+            USE_TEST_NOTE_FRAME_TO_TIME=0
+        )
+        if(NOT FFTW3F_LIB)
+            find_library(FFTW3F_LIB fftw3f)
+        endif()
+        target_link_libraries(pipitch_test PRIVATE
+            RTNeural
+            ${LV2_ONNXRUNTIME_LIB}
+            ${JACK_LIB}
+            $<$<BOOL:${FFTW3F_LIB}>:${FFTW3F_LIB}>
+            pthread dl
+        )
+        message(STATUS "LV2: pipitch_test target enabled")
+    endif()
+
     # ── Install targets ───────────────────────────────────────────────────────
     set(LV2_INSTALL_PATH "/zynthian/zynthian-plugins/lv2"
         CACHE STRING "Destination for the LV2 bundle (default: Zynthian LV2 path)")

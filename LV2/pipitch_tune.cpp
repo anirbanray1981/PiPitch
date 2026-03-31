@@ -644,8 +644,11 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     if (gated) resampled.assign(static_cast<int>(nFrames * (PLUGIN_SR / m->sampleRate)), 0.0f);
     else       resampleLinear(in, static_cast<int>(nFrames), m->sampleRate, resampled);
 
+    // GoertzelPoly bypasses the entire ring/OBP/CNN pipeline.
+    const bool goertzelMode = (m->mode == PlayMode::GOERTZEL_POLY);
     for (auto& rp : m->ranges) {
         RangeState& r = *rp;
+        if (goertzelMode) continue;
 
         // Flush ring on onset: zero stale audio so SwiftF0 only sees the new note.
         // Fires on PICK onsets and strong RMS onsets (ratio > 3).
@@ -658,6 +661,7 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         pushRingSamples(r, resampled.data(), static_cast<int>(resampled.size()));
 
         // Two-phase OneBitPitch + MPM — skipped when provisional != on.
+        // (GoertzelPoly never reaches here — range loop is skipped above.)
         const bool provEnabled = (m->provisionalMode == ProvMode::ON
                                   || m->provisionalMode == ProvMode::ADAPTIVE);
         if (provEnabled) {
@@ -938,8 +942,8 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
     // ── GoertzelPoly: sample-by-sample in audio thread (AArch64 only) ───
 #ifdef __aarch64__
     if (m->mode == PlayMode::GOERTZEL_POLY && !gated) {
-        const float transRatio = (m->pickFiredRemain > 0) ? 10.0f : 1.0f;
-        m->goertzel.processBlock(in, static_cast<int>(nFrames), transRatio);
+        m->goertzel.processBlock(in, static_cast<int>(nFrames),
+                                  onsetFired && m->pickFiredRemain > 0);
 
         // Check note states using triggerPending (fire-once per onset)
         auto& states = m->goertzel.getNoteStates();
@@ -956,18 +960,32 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
 
             if (s.isActive() && !(m->goertzelPrevBits & bit)) {
                 if (s.triggerPending) {
-                    std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d  [Goertzel]\n",
-                                elapsed, midiToName(midi).c_str(), midi, s.velocity);
-                    int best = 0;
-                    float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
-                    for (int v = 0; v < MAX_VOICES; ++v) {
-                        if (m->voices[v].state == 0) { best = v; break; }
-                        if (m->voices[v].envLevel < bestLevel) { bestLevel = m->voices[v].envLevel; best = v; }
+                    // Octave-lock: suppress if ±12/±24 semitones from any
+                    // already-active Goertzel note (harmonic false positive).
+                    bool octLocked = false;
+                    for (uint64_t tmp = m->goertzelPrevBits; tmp; tmp &= tmp - 1) {
+                        const int act = NOTE_BASE + __builtin_ctzll(tmp);
+                        const int diff = std::abs(midi - act);
+                        if (diff == 12 || diff == 24) { octLocked = true; break; }
                     }
-                    m->voices[best] = { midi, midiToFreq(midi), 0.0, s.velocity / 127.0f, 1, 0.0f };
-                    s.triggerPending = false;
-                    m->goertzelPrevBits |= bit;
-                    flushed = true;
+                    if (octLocked) {
+                        std::printf("[+%.3fs]  --   %-4s (%3d)  suppressed (octave-lock)  [Goertzel]\n",
+                                    elapsed, midiToName(midi).c_str(), midi);
+                        flushed = true;
+                    } else {
+                        std::printf("[+%.3fs]  ON   %-4s (%3d)  vel %3d  [Goertzel]\n",
+                                    elapsed, midiToName(midi).c_str(), midi, s.velocity);
+                        int best = 0;
+                        float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+                        for (int v = 0; v < MAX_VOICES; ++v) {
+                            if (m->voices[v].state == 0) { best = v; break; }
+                            if (m->voices[v].envLevel < bestLevel) { bestLevel = m->voices[v].envLevel; best = v; }
+                        }
+                        m->voices[best] = { midi, midiToFreq(midi), 0.0, s.velocity / 127.0f, 1, 0.0f };
+                        m->goertzelPrevBits |= bit;
+                        flushed = true;
+                    }
+                    s.triggerPending = false;  // consume regardless
                 }
             } else if (!s.isActive() && (m->goertzelPrevBits & bit)) {
                 std::printf("[+%.3fs]  OFF  %-4s (%3d)  [Goertzel]\n",

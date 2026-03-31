@@ -509,8 +509,11 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     static const float zeros[8192] = {};
 
     // Push audio into each range's ring; dispatch snapshot when ready — lockless
+    // GoertzelPoly bypasses the entire ring/OBP/CNN pipeline.
+    const bool goertzelMode = (self->modeVal.load(std::memory_order_relaxed) == 4);
     for (auto& rp : self->ranges) {
         RangeState& r = *rp;
+        if (goertzelMode) continue;
 
         if (!gated) {
             // Flush ring on onset: zero stale audio so SwiftF0 only sees the
@@ -523,6 +526,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
             // Two-phase OneBitPitch + MPM — skipped when provisional != on.
+            // (GoertzelPoly never reaches here — range loop is skipped above.)
             const int pvNow = self->provisionalVal.load(std::memory_order_relaxed);
             const bool provEnabled = (pvNow == 0 || pvNow == 3);  // on or adaptive
             if (provEnabled) {
@@ -774,8 +778,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     // Only available on AArch64 (Pi 5) — requires NEON SIMD.
 #ifdef __aarch64__
     if (self->modeVal.load(std::memory_order_relaxed) == 4 && !gated) {
-        const float transRatio = (self->pickFiredRemain > 0) ? 10.0f : 1.0f;
-        self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples), transRatio);
+        self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples),
+                                     onsetFired && self->pickFiredRemain > 0);
 
         // Check note states using triggerPending (fire-once per onset)
         auto& states = self->goertzel.getNoteStates();
@@ -789,11 +793,21 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             if (s.isActive() && !(self->goertzelPrevBits & bit)) {
                 // New note-ON: only fire if triggerPending (prevents re-trigger)
                 if (s.triggerPending) {
-                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                              0x90, static_cast<uint8_t>(midi),
-                              static_cast<uint8_t>(s.velocity));
-                    s.triggerPending = false;  // consume
-                    self->goertzelPrevBits |= bit;
+                    // Octave-lock: suppress if ±12/±24 semitones from any
+                    // already-active Goertzel note (harmonic false positive).
+                    bool octLocked = false;
+                    for (uint64_t tmp = self->goertzelPrevBits; tmp; tmp &= tmp - 1) {
+                        const int act = NOTE_BASE + __builtin_ctzll(tmp);
+                        const int diff = std::abs(midi - act);
+                        if (diff == 12 || diff == 24) { octLocked = true; break; }
+                    }
+                    if (!octLocked) {
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  0x90, static_cast<uint8_t>(midi),
+                                  static_cast<uint8_t>(s.velocity));
+                        self->goertzelPrevBits |= bit;
+                    }
+                    s.triggerPending = false;  // consume regardless
                 }
             } else if (!s.isActive() && (self->goertzelPrevBits & bit)) {
                 // Note-OFF
