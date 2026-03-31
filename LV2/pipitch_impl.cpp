@@ -415,6 +415,9 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                           pn.type == PendingNote::NOTE_ON ? uint8_t(0x90) : uint8_t(0x80),
                           static_cast<uint8_t>(pn.pitch),
                           pn.type == PendingNote::NOTE_ON ? static_cast<uint8_t>(pn.value) : uint8_t(0));
+                // Clear pending provisional if worker already sent this note
+                if (pn.type == PendingNote::NOTE_ON && rp->pendingProvNote == pn.pitch)
+                    rp->pendingProvNote = -1;
             }
         }
     }
@@ -503,11 +506,10 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         RangeState& r = *rp;
 
         if (!gated) {
-            // Flush ring on PICK onset: zero stale audio so SwiftF0 only sees
-            // the new note.  Only on PICK (genuine attack), not RMS (energy fluctuation).
-            // Note: don't touch holdNotes/activeNotes here — those are worker-owned.
-            // The zeroed ring causes SwiftF0 to detect silence → notes expire via hold.
-            if (onsetFired && self->pickFiredRemain > 0) {
+            // Flush ring on onset: zero stale audio so SwiftF0 only sees the
+            // new note.  Fires on PICK onsets and strong RMS onsets (ratio > 3).
+            // Note: don't touch holdNotes/activeNotes — those are worker-owned.
+            if (onsetFired) {
                 std::memset(r.ring.data(), 0, r.ringSize * sizeof(float));
                 r.freshSamples = 0;
             }
@@ -777,6 +779,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                           pn.type == PendingNote::NOTE_ON ? uint8_t(0x90) : uint8_t(0x80),
                           static_cast<uint8_t>(pn.pitch),
                           pn.type == PendingNote::NOTE_ON ? static_cast<uint8_t>(pn.value) : uint8_t(0));
+                if (pn.type == PendingNote::NOTE_ON && rp->pendingProvNote == pn.pitch)
+                    rp->pendingProvNote = -1;
             }
         }
     }

@@ -16,18 +16,25 @@
 // notes where OBP produces a result every callback) while being equally or more
 // strict: no gaps are tolerated once positive detections begin.
 struct OBPVotingBuffer {
-    static constexpr int N_CONSEC = 4;  // consecutive agreeing detections required
+    static constexpr int N_CONSEC_BASS = 2;  // E2–A2: long periods, fewer readings needed
+    static constexpr int N_CONSEC_MID  = 4;  // A#2–E4: standard
+    static constexpr int N_CONSEC_HIGH = 8;  // > E4: more readings to avoid pick chirps
+    static constexpr int A2_MIDI       = 45; // E2=40 .. A2=45
+    static constexpr int E4_MIDI       = 64;
 
     int note = -1;
     int run  = 0;
 
     // Call once per OBP detection cycle. detected == -1 means no pitch found.
     // Returns the elected note number [0..127] after N_CONSEC consecutive matches;
-    // -1 otherwise.
+    // -1 otherwise.  High notes (> E4) require more readings to avoid chirps
+    // from pick noise harmonics.
     int update(int detected) noexcept {
         if (detected < 0) return -1;  // no result yet — preserve current run
         if (detected == note) {
-            if (++run >= N_CONSEC) return note;
+            const int threshold = (note > E4_MIDI)  ? N_CONSEC_HIGH :
+                                  (note <= A2_MIDI) ? N_CONSEC_BASS : N_CONSEC_MID;
+            if (++run >= threshold) return note;
         } else {
             note = detected;
             run  = 1;
