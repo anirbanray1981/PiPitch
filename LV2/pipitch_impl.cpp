@@ -506,7 +506,8 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
             // Two-phase OneBitPitch + MPM — skipped when provisional != on.
-            const bool provEnabled = (self->provisionalVal.load(std::memory_order_relaxed) == 0);
+            const int pvNow = self->provisionalVal.load(std::memory_order_relaxed);
+            const bool provEnabled = (pvNow == 0 || pvNow == 3);  // on or adaptive
             if (provEnabled) {
 
             armOrExpireOBP(r, static_cast<float>(self->sampleRate),
@@ -600,10 +601,32 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                         }
                     }
                 }}
-                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
-                          0x90, static_cast<uint8_t>(note), uint8_t(100));
-                r.provNote.store(note, std::memory_order_release);
-                r.monoHeldNote.store(note, std::memory_order_release);
+                // Kill existing provisional in this range if different note
+                {   const int oldProv = r.provNote.load(std::memory_order_acquire);
+                    if (oldProv != -1 && oldProv != note) {
+                        writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                                  0x80, static_cast<uint8_t>(oldProv), uint8_t(0));
+                        // Reset pitch bend if it was snapped
+                        if (r.provBentTo >= 0) {
+                            writeMidi(&self->forge, 1, self->uris.midi_MidiEvent,
+                                      0xE0, uint8_t(0), uint8_t(0x40)); // center
+                        }
+                    }
+                }
+                const int pv = self->provisionalVal.load(std::memory_order_relaxed);
+                if (pv == 3) {
+                    // Adaptive mode: don't send MIDI ON; worker decides after SwiftF0
+                    r.provNote.store(note, std::memory_order_release);
+                    r.monoHeldNote.store(note, std::memory_order_release);
+                } else {
+                    // Normal mode: send MIDI ON at muted velocity (~30%)
+                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                              0x90, static_cast<uint8_t>(note), uint8_t(40));
+                    r.provNote.store(note, std::memory_order_release);
+                    r.monoHeldNote.store(note, std::memory_order_release);
+                }
+                r.provBentTo = -1;  // reset bend snap state
+                r.provNeedsBoost = (pv != 3);  // muted provisional needs velocity boost
                 r.provCooldownRemain = static_cast<int>(self->sampleRate * 0.2);
                 r.provCooldownNote   = note;
             };

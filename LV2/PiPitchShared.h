@@ -364,6 +364,8 @@ struct RangeStateBase {
 
     // Pitch bend tracker (worker-only, swiftmono)
     PitchBendTracker    bendTracker;
+    int                 provBentTo     = -1;   // if >=0, provisional was bend-snapped to this MIDI note
+    bool                provNeedsBoost = false; // muted provisional awaiting velocity boost from SwiftF0
 
 #ifdef PIPITCH_ENABLE_MPM
     McLeodPitchDetector mpm;  // FFT autocorrelation — agrees with OBP before prov fires
@@ -1152,6 +1154,56 @@ static void runWorkerCommon(Hooks& h)
                 }
             }
 
+            // ── Pitch bend snap (Option 2) ────────────────────────────────
+            // When the active note and SwiftF0's detection differ by ±1-3
+            // semitones on a SUSTAINED note, use pitch bend instead of OFF+ON.
+            // Only fires after the onset settles (>30ms) to avoid intercepting
+            // legitimate note changes from new pick attacks.
+            if (swiftMono && newBits && r.activeNotes && provMode != 3
+                && newBits != r.activeNotes) {
+                const uint64_t elSamp = h.totalSamples() - h.lastOnsetSample();
+                const float msSinceOnset = static_cast<float>(elSamp * 1000.0 / h.sampleRate());
+                if (msSinceOnset > 50.0f) {  // only on sustained notes, not transitions
+                    const int sf0Note = NOTE_BASE + static_cast<int>(__builtin_ctzll(newBits));
+                    const int actNote = NOTE_BASE + static_cast<int>(__builtin_ctzll(r.activeNotes));
+                    const int diff = sf0Note - actNote;
+                    if (diff != 0 && std::abs(diff) <= 3) {
+                        // Snap via pitch bend: keep active note, shift frequency
+                        const float cents = diff * 100.0f;
+                        const int bendVal = 8192 + static_cast<int>(
+                            (cents / PitchBendTracker::BEND_RANGE_CENTS) * 8191.0f);
+                        r.midiOut.push(PendingNote::bend(std::clamp(bendVal, 0, 16383)));
+                        r.provBentTo = sf0Note;
+                        // Replace newBits with active note so it stays alive
+                        newBits = r.activeNotes;
+                        for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
+                            newVel[__builtin_ctzll(tmp)] = 100;
+                        if (provForDiff != -1) provForDiff = -1;
+                    }
+                }
+            }
+
+            // ── Adaptive confirmation (Option 3) ─────────────────────────
+            // In adaptive mode, provisional wasn't sent as MIDI yet.  Send
+            // the confirmed note now (SwiftF0's note if different, else prov).
+            if (provMode == 3 && provForDiff != -1) {
+                const int confirmedNote = newBits
+                    ? NOTE_BASE + __builtin_ctzll(newBits) : provForDiff;
+                // Send MIDI ON at full velocity for the confirmed note
+                r.midiOut.push({true, confirmedNote, 100});
+                if (confirmedNote != provForDiff) {
+                    // SwiftF0 corrected — update activeNotes to reflect real note
+                    if (provForDiff >= NOTE_BASE && provForDiff < NOTE_BASE + NOTE_COUNT)
+                        r.activeNotes &= ~(1ULL << (provForDiff - NOTE_BASE));
+                    if (confirmedNote >= NOTE_BASE && confirmedNote < NOTE_BASE + NOTE_COUNT) {
+                        r.activeNotes |= (1ULL << (confirmedNote - NOTE_BASE));
+                        newBits = 1ULL << (confirmedNote - NOTE_BASE);
+                        newVel[confirmedNote - NOTE_BASE] = 100;
+                    }
+                }
+                provForDiff = -1;  // consumed
+            }
+
             // CNN outcome hook (BasicPitch path only, when provisional present)
             if (!swiftMono && !swiftPoly && provForDiff != -1)
                 h.onCNNOutcome(r, provForDiff, newBits, inferMs);
@@ -1177,6 +1229,23 @@ static void runWorkerCommon(Hooks& h)
 
             applyNotesDiff(r, newBits, newVel, provForDiff, mono,
                            swiftMono ? r.cfg.swiftHoldCycles : -1);
+
+            // Velocity boost: muted provisional confirmed by SwiftF0.
+            // Send a full-velocity Note-ON for the active note to replace
+            // the muted provisional's vel 40.
+            if (r.provNeedsBoost && r.activeNotes) {
+                const int boostNote = NOTE_BASE + __builtin_ctzll(r.activeNotes);
+                r.midiOut.push({true, boostNote, 100});
+                r.provNeedsBoost = false;
+            } else if (!r.activeNotes) {
+                r.provNeedsBoost = false;
+            }
+
+            // Reset pitch bend if the bent note went OFF
+            if (r.provBentTo >= 0 && !r.activeNotes) {
+                r.midiOut.push(PendingNote::bend(8192));
+                r.provBentTo = -1;
+            }
 
             // Notes changed hook (ON/OFF logging)
             h.onNotesChanged(r, prevActive, newVel, inferMs, modeLabel);

@@ -411,6 +411,16 @@ static void processSynth(Monitor* m, float* out, int nFrames)
             }
         }
 
+        // Kill existing provisional in this range if different note
+        {   const int oldProv = rp.provNote.load(std::memory_order_acquire);
+            if (oldProv != -1 && oldProv != pp) {
+                rp.midiOut.push({false, oldProv, 0});  // queue OFF for worker drain
+                if (rp.provBentTo >= 0) {
+                    rp.midiOut.push(PendingNote::bend(8192));  // reset bend
+                    rp.provBentTo = -1;
+                }
+            }
+        }
         rp.provOnTimeMs = elapsed * 1000.0;  // ms since startTime
 
         // Mono/SwiftMono: release all currently playing voices before firing new note
@@ -425,18 +435,29 @@ static void processSynth(Monitor* m, float* out, int nFrames)
             if (v.pitch == pp && v.state != 0 && v.state != 3)
                 v.state = 3;
 
-        std::printf("[+%.3fs]  ON   %-4s (%3d)  vel 100"
-                    "  [1-bit provisional  range %s]\n",
-                    elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
-        std::fflush(stdout);
-        int   best      = 0;
-        float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
-        for (int i = 0; i < MAX_VOICES; ++i) {
-            if (m->voices[i].state == 0) { best = i; break; }
-            const float l = m->voices[i].envLevel;
-            if (l < bestLevel) { bestLevel = l; best = i; }
+        if (m->provisionalMode == ProvMode::ADAPTIVE) {
+            // Adaptive: don't fire synth voice — worker decides after SwiftF0
+            std::printf("[+%.3fs]  ON   %-4s (%3d)  vel ---"
+                        "  [provisional HELD for SwiftF0  range %s]\n",
+                        elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
+            std::fflush(stdout);
+        } else {
+            // Normal: muted provisional (~30% velocity)
+            const float mutedVel = 40.0f / 127.0f;
+            std::printf("[+%.3fs]  ON   %-4s (%3d)  vel  40"
+                        "  [1-bit provisional  range %s]\n",
+                        elapsed, midiToName(pp).c_str(), pp, rp.cfg.name.c_str());
+            std::fflush(stdout);
+            int   best      = 0;
+            float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+            for (int i = 0; i < MAX_VOICES; ++i) {
+                if (m->voices[i].state == 0) { best = i; break; }
+                const float l = m->voices[i].envLevel;
+                if (l < bestLevel) { bestLevel = l; best = i; }
+            }
+            m->voices[best] = { pp, midiToFreq(pp), 0.0, mutedVel, 1, 0.0f };
+            rp.provNeedsBoost = true;
         }
-        m->voices[best] = { pp, midiToFreq(pp), 0.0, 100.0f / 127.0f, 1, 0.0f };
         rp.provCooldownRemain = static_cast<int>(m->sampleRate * 0.2);
         rp.provCooldownNote   = pp;
     }
@@ -454,19 +475,36 @@ static void processSynth(Monitor* m, float* out, int nFrames)
                         m->voices[i].freq = midiToFreq(m->voices[i].pitch) * bendRatio;
                 }
             } else if (pn.type == PendingNote::NOTE_ON) {
-                std::printf("[+%.3fs]  >>   %-4s (%3d)  vel %3d"
-                            "  [synth ON   range %s]\n",
-                            elapsed, midiToName(pn.pitch).c_str(),
-                            pn.pitch, pn.value, rp->cfg.name.c_str());
-                std::fflush(stdout);
-                int   best      = 0;
-                float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+                // Check if this note is already playing — if so, just boost velocity
+                // (don't retrigger envelope). This handles the muted→full velocity boost.
+                bool boosted = false;
                 for (int i = 0; i < MAX_VOICES; ++i) {
-                    if (m->voices[i].state == 0) { best = i; break; }
-                    const float l = m->voices[i].envLevel;
-                    if (l < bestLevel) { bestLevel = l; best = i; }
+                    if (m->voices[i].pitch == pn.pitch && m->voices[i].state == 1) {
+                        m->voices[i].velocity = pn.value / 127.0f;
+                        boosted = true;
+                        std::printf("[+%.3fs]  >>   %-4s (%3d)  vel %3d"
+                                    "  [synth BOOST range %s]\n",
+                                    elapsed, midiToName(pn.pitch).c_str(),
+                                    pn.pitch, pn.value, rp->cfg.name.c_str());
+                        std::fflush(stdout);
+                        break;
+                    }
                 }
-                m->voices[best] = { pn.pitch, midiToFreq(pn.pitch), 0.0, pn.value / 127.0f, 1, 0.0f };
+                if (!boosted) {
+                    std::printf("[+%.3fs]  >>   %-4s (%3d)  vel %3d"
+                                "  [synth ON   range %s]\n",
+                                elapsed, midiToName(pn.pitch).c_str(),
+                                pn.pitch, pn.value, rp->cfg.name.c_str());
+                    std::fflush(stdout);
+                    int   best      = 0;
+                    float bestLevel = m->voices[0].envLevel + (m->voices[0].state != 0 ? 1.0f : 0.0f);
+                    for (int i = 0; i < MAX_VOICES; ++i) {
+                        if (m->voices[i].state == 0) { best = i; break; }
+                        const float l = m->voices[i].envLevel;
+                        if (l < bestLevel) { bestLevel = l; best = i; }
+                    }
+                    m->voices[best] = { pn.pitch, midiToFreq(pn.pitch), 0.0, pn.value / 127.0f, 1, 0.0f };
+                }
             } else {
                 std::printf("[+%.3fs]  >>   %-4s (%3d)          "
                             "  [synth OFF  range %s]\n",
@@ -590,7 +628,8 @@ static int jackProcess(jack_nframes_t nFrames, void* arg)
         pushRingSamples(r, resampled.data(), static_cast<int>(resampled.size()));
 
         // Two-phase OneBitPitch + MPM — skipped when provisional != on.
-        const bool provEnabled = (m->provisionalMode == ProvMode::ON);
+        const bool provEnabled = (m->provisionalMode == ProvMode::ON
+                                  || m->provisionalMode == ProvMode::ADAPTIVE);
         if (provEnabled) {
 
         // Mono cross-range guard: in mono mode, returns true if any OTHER range
@@ -908,10 +947,11 @@ int main(int argc, char** argv)
         }
         else if (!std::strcmp(argv[i], "--provisional")      && i+1 < argc) {
             const char* s = argv[++i];
-            if      (!std::strcmp(s, "swift")) provisionalMode = ProvMode::SWIFT;
+            if      (!std::strcmp(s, "swift"))    provisionalMode = ProvMode::SWIFT;
+            else if (!std::strcmp(s, "adaptive")) provisionalMode = ProvMode::ADAPTIVE;
             else if (!std::strcmp(s, "none") || !std::strcmp(s, "off"))
-                                               provisionalMode = ProvMode::NONE;
-            else                               provisionalMode = ProvMode::ON;
+                                                  provisionalMode = ProvMode::NONE;
+            else                                  provisionalMode = ProvMode::ON;
             provisionalSet = true;
         }
         else if (!std::strcmp(argv[i], "--octave-lock")     && i+1 < argc) octaveLockMs   = std::stof(argv[++i]);
@@ -1014,8 +1054,9 @@ int main(int argc, char** argv)
     if (rangeCfg.mode == PlayMode::SWIFT_MONO || rangeCfg.mode == PlayMode::SWIFT_POLY)
         std::printf("SwiftThr:   %.2f\n", rangeCfg.swiftF0Threshold);
     std::printf("Provisional:%s\n",
-                rangeCfg.provisionalMode == ProvMode::SWIFT ? " swift" :
-                rangeCfg.provisionalMode == ProvMode::NONE  ? " none" : " on");
+                rangeCfg.provisionalMode == ProvMode::SWIFT    ? " swift" :
+                rangeCfg.provisionalMode == ProvMode::ADAPTIVE ? " adaptive" :
+                rangeCfg.provisionalMode == ProvMode::NONE     ? " none" : " on");
     std::printf("OnsetBlank: %.0f ms\n", rangeCfg.onsetBlankMs);
     std::printf("OctaveLock: %.0f ms%s\n", rangeCfg.octaveLockMs,
                 rangeCfg.octaveLockMs <= 0.0f ? " [disabled]" : "");
