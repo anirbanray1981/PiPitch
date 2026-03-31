@@ -898,7 +898,8 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--provisional")      && i+1 < argc) {
             const char* s = argv[++i];
             if      (!std::strcmp(s, "swift")) provisionalMode = ProvMode::SWIFT;
-            else if (!std::strcmp(s, "none"))  provisionalMode = ProvMode::NONE;
+            else if (!std::strcmp(s, "none") || !std::strcmp(s, "off"))
+                                               provisionalMode = ProvMode::NONE;
             else                               provisionalMode = ProvMode::ON;
             provisionalSet = true;
         }

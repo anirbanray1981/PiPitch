@@ -128,7 +128,7 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
         if (key == "octave_lock_ms")  { cfg.octaveLockMs    = std::stof(val); continue; }
         if (key == "provisional") {
             if      (val == "swift") cfg.provisionalMode = ProvMode::SWIFT;
-            else if (val == "none")  cfg.provisionalMode = ProvMode::NONE;
+            else if (val == "none" || val == "off") cfg.provisionalMode = ProvMode::NONE;
             else                     cfg.provisionalMode = ProvMode::ON;
             continue;
         }
