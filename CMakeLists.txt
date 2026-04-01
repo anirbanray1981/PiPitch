@@ -94,8 +94,15 @@ if(BUILD_LV2)
 
     # ── Implementation .so files (one per SIMD tier) ──────────────────────────
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-        pipitch_add_impl(NEON   "pipitch_impl_neon"   -march=armv8-a+simd)
-        pipitch_add_impl(ARMv82 "pipitch_impl_armv82" -march=armv8.2-a+dotprod+fp16)
+        pipitch_add_impl(NEON   "pipitch_impl_neon"   -mcpu=cortex-a72 -march=armv8-a+simd)
+        pipitch_add_impl(ARMv82 "pipitch_impl_armv82" -mcpu=cortex-a76 -march=armv8.2-a+dotprod+fp16)
+        # ARMv82 (Pi 5) compiles MPM which requires FFTW3f
+        if(NOT FFTW3F_LIB)
+            find_library(FFTW3F_LIB fftw3f)
+        endif()
+        if(FFTW3F_LIB)
+            target_link_libraries(PiPitchImpl_ARMv82 PRIVATE ${FFTW3F_LIB})
+        endif()
         message(STATUS "LV2: building aarch64 impls: neon + armv8.2-a+dotprod+fp16")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         pipitch_add_impl(SSE42  "pipitch_impl_sse42"  -msse4.2)
