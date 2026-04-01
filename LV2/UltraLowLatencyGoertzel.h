@@ -197,7 +197,8 @@ public:
      * @param nSamples   Block size (typically 64)
      * @param onsetFired True if a pick onset was detected THIS block
      */
-    void processBlock(const float* input, int nSamples, bool onsetFired = false)
+    void processBlock(const float* input, int nSamples, bool onsetFired = false,
+                       bool polyMode = false)
     {
         if (nSamples <= 0 || nSamples > MAX_BLOCK_SIZE) return;
 
@@ -206,28 +207,29 @@ public:
             blankRemain_ = onsetBlankSamples_;
             onsetRemain_ = onsetWindowSamples_;
 
-            // Accelerate decay for all active notes on onset.
-            // IIR ring-up fills the confidence buffer with stale energy,
-            // blocking the new note from reaching confidence threshold.
-            // Halve s1/s2 and reset activeCount so the new note starts fresh.
-            constexpr float ONSET_QUENCH = 0.5f;
-            for (int i = 0; i < numNotes_; ++i) {
-                if (noteStates_[i].isMidiOn) {
-                    noteStates_[i].activeCount = 0;
-                    noteStates_[i].holdRemain  = 0;
-                    int gi = i / 4, lane = i % 4;
+            // Onset quench: accelerate decay for active notes so new note
+            // can build confidence.  DISABLED in polyMode — chord strums need
+            // notes to accumulate, not cancel each other.
+            if (!polyMode) {
+                constexpr float ONSET_QUENCH = 0.5f;
+                for (int i = 0; i < numNotes_; ++i) {
+                    if (noteStates_[i].isMidiOn) {
+                        noteStates_[i].activeCount = 0;
+                        noteStates_[i].holdRemain  = 0;
+                        int gi = i / 4, lane = i % 4;
 #ifdef __aarch64__
-                    float s1[4], s2[4];
-                    vst1q_f32(s1, groups_[gi].s1);
-                    vst1q_f32(s2, groups_[gi].s2);
-                    s1[lane] *= ONSET_QUENCH;
-                    s2[lane] *= ONSET_QUENCH;
-                    groups_[gi].s1 = vld1q_f32(s1);
-                    groups_[gi].s2 = vld1q_f32(s2);
+                        float s1[4], s2[4];
+                        vst1q_f32(s1, groups_[gi].s1);
+                        vst1q_f32(s2, groups_[gi].s2);
+                        s1[lane] *= ONSET_QUENCH;
+                        s2[lane] *= ONSET_QUENCH;
+                        groups_[gi].s1 = vld1q_f32(s1);
+                        groups_[gi].s2 = vld1q_f32(s2);
 #else
-                    groups_[gi].s1[lane] *= ONSET_QUENCH;
-                    groups_[gi].s2[lane] *= ONSET_QUENCH;
+                        groups_[gi].s1[lane] *= ONSET_QUENCH;
+                        groups_[gi].s2[lane] *= ONSET_QUENCH;
 #endif
+                    }
                 }
             }
         }

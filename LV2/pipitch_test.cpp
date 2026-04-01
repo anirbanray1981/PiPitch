@@ -500,7 +500,10 @@ struct TestState {
 #ifdef __aarch64__
     UltraLowLatencyGoertzel goertzel;
     uint64_t goertzelPrevBits = 0;
+    int      goertzelNoteWindow = 0;
+    int      goertzelPolyOnCount = 0;
 #endif
+    int      maxPoly = 3;
     std::vector<float> sf0Buf;
 
     std::thread       workerThread;
@@ -538,6 +541,7 @@ struct TestWorkerHooks {
         return st->audioTimeS.load(std::memory_order_relaxed);
     }
 
+    void onGoertzelPolyResult(TestRangeState&, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, double) {}
     void onSwiftResult(TestRangeState& r, int effectiveNote, double inferMs) {
         if (effectiveNote != r.lastSwiftPrint) {
             r.lastSwiftPrint = effectiveNote;
@@ -654,12 +658,20 @@ static void processTestBlock(TestState* st, const float* blockIn, int nSamples)
     if (gated) resampled.assign(static_cast<int>(nSamples * (PLUGIN_SR / st->sampleRate)), 0.0f);
     else       resampleLinear(blockIn, nSamples, st->sampleRate, resampled);
 
-    // GoertzelPoly bypasses ring/OBP/CNN pipeline
-    const bool goertzelMode = (st->mode == PlayMode::GOERTZEL_POLY);
+    // GoertzelMono bypasses ring/OBP/CNN pipeline
+    const bool goertzelMono = (st->mode == PlayMode::GOERTZEL_MONO);
+    const bool goertzelPoly = (st->mode == PlayMode::GOERTZEL_POLY);
 
     for (auto& rp : st->ranges) {
         TestRangeState& r = *rp;
-        if (goertzelMode) continue;
+        if (goertzelMono) continue;
+
+        // GoertzelPoly: feed ring and dispatch for CNN, skip OBP/provisional
+        if (goertzelPoly) {
+            pushRingSamples(r, resampled.data(), static_cast<int>(resampled.size()));
+            dispatchSnapshotIfReady(r, onsetFired, 0.0, st->workerSem, gateFloor);
+            continue;
+        }
 
         if (!gated) {
             if (onsetFired) {
@@ -735,9 +747,9 @@ static void processTestBlock(TestState* st, const float* blockIn, int nSamples)
         dispatchSnapshotIfReady(r, onsetFired, 0.0, st->workerSem, gateFloor);
     }
 
-    // GoertzelPoly audio-thread processing
+    // GoertzelMono audio-thread processing
 #ifdef __aarch64__
-    if (st->mode == PlayMode::GOERTZEL_POLY && !gated) {
+    if (st->mode == PlayMode::GOERTZEL_MONO && !gated) {
         st->goertzel.processBlock(blockIn, nSamples, onsetFired);
 
         auto& states = st->goertzel.getNoteStates();
@@ -771,7 +783,7 @@ static void processTestBlock(TestState* st, const float* blockIn, int nSamples)
                 st->goertzelPrevBits &= ~bit;
             }
         }
-    } else if (st->mode == PlayMode::GOERTZEL_POLY && gated) {
+    } else if (st->mode == PlayMode::GOERTZEL_MONO && gated) {
         st->goertzel.drainGated(nSamples);
         auto& states = st->goertzel.getNoteStates();
         const int gStart = st->goertzel.startMidi();
@@ -786,6 +798,66 @@ static void processTestBlock(TestState* st, const float* blockIn, int nSamples)
                 st->goertzelPrevBits &= ~bit;
             }
         }
+    }
+
+    // GoertzelPoly audio-thread processing
+    if (goertzelPoly && !gated) {
+        st->goertzel.processBlock(blockIn, nSamples, onsetFired, true);
+
+        auto& states = st->goertzel.getNoteStates();
+        const int gStart = st->goertzel.startMidi();
+        const double el = st->audioTimeS.load(std::memory_order_relaxed);
+
+        if (onsetFired) {
+            if (st->goertzelNoteWindow <= 0)
+                st->goertzelPolyOnCount = 0;
+            st->goertzelNoteWindow = static_cast<int>(st->sampleRate * 0.05);
+        }
+        if (st->goertzelNoteWindow > 0)
+            st->goertzelNoteWindow -= nSamples;
+
+        for (int i = 0; i < st->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            auto& s = states[i];
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+
+            if (s.isActive() && s.triggerPending && !(st->goertzelPrevBits & bit)) {
+                s.triggerPending = false;
+                if (st->goertzelNoteWindow > 0 && st->goertzelPolyOnCount < st->maxPoly) {
+                    std::lock_guard<std::mutex> lock(st->eventsMtx);
+                    st->events.push_back({el, midi, true, 40});
+                    st->goertzelPrevBits |= bit;
+                    st->goertzelPolyOnCount++;
+                }
+            }
+            if (!s.isActive() && (st->goertzelPrevBits & bit)) {
+                std::lock_guard<std::mutex> lock(st->eventsMtx);
+                st->events.push_back({el, midi, false, 0});
+                st->goertzelPrevBits &= ~bit;
+            }
+        }
+
+        for (auto& rp : st->ranges)
+            rp->goertzelPolyActiveBits.store(st->goertzelPrevBits, std::memory_order_release);
+
+    } else if (goertzelPoly && gated) {
+        st->goertzel.drainGated(nSamples);
+        auto& states = st->goertzel.getNoteStates();
+        const int gStart = st->goertzel.startMidi();
+        const double el = st->audioTimeS.load(std::memory_order_relaxed);
+        for (int i = 0; i < st->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+            if (!states[i].isActive() && (st->goertzelPrevBits & bit)) {
+                std::lock_guard<std::mutex> lock(st->eventsMtx);
+                st->events.push_back({el, midi, false, 0});
+                st->goertzelPrevBits &= ~bit;
+            }
+        }
+        for (auto& rp : st->ranges)
+            rp->goertzelPolyActiveBits.store(st->goertzelPrevBits, std::memory_order_release);
     }
 #endif
 
@@ -1014,6 +1086,7 @@ static int runTest(const char* inputPath, const char* labelPath,
     st.mode             = rangeCfg.mode;
     st.provisionalMode  = rangeCfg.provisionalMode;
     st.octaveLockMs     = rangeCfg.octaveLockMs;
+    st.maxPoly          = rangeCfg.maxPoly;
     st.bendEnabled      = rangeCfg.bendEnabled;
 
     // Try to load SwiftF0
@@ -1060,6 +1133,7 @@ static int runTest(const char* inputPath, const char* labelPath,
                 st.mode == PlayMode::MONO       ? "mono" :
                 st.mode == PlayMode::SWIFT_MONO ? "swiftmono" :
                 st.mode == PlayMode::SWIFT_POLY ? "swiftpoly" :
+                st.mode == PlayMode::GOERTZEL_MONO ? "goertzelmono" :
                 st.mode == PlayMode::GOERTZEL_POLY ? "goertzelpoly" : "poly");
     std::printf("Block:   %d samples (%.1f ms)\n", blockSize,
                 blockSize * 1000.0 / st.sampleRate);
@@ -1154,7 +1228,8 @@ static void printUsage(const char* prog)
         "  %s record -o <output.wav> [--port <jack_port>]\n"
         "  %s test   -i <input.wav> -l <labels.txt>\n"
         "             [--bundle PATH] [--config PATH]\n"
-        "             [--mode mono|poly|swiftmono|swiftpoly|goertzelpoly]\n"
+        "             [--mode mono|poly|swiftmono|swiftpoly|goertzelmono|goertzelpoly]\n"
+        "             [--max-poly N]\n"
         "             [--provisional on|swift|none|adaptive]\n"
         "             [--threshold F] [--frame-threshold F]\n"
         "             [--gate F] [--amp-floor F]\n"
@@ -1188,6 +1263,7 @@ int main(int argc, char** argv)
         std::string bundlePath, configPath;
         int  blockSize = 64;
         bool modeSet = false, provSet = false;
+        int  maxPolyOverride = -1;
         PlayMode mode = PlayMode::MONO;
         ProvMode prov = ProvMode::ON;
         float threshold = -1, frameThr = -1, gate = -1, ampFloor = -1;
@@ -1216,6 +1292,7 @@ int main(int argc, char** argv)
                 if      (!std::strcmp(s, "mono"))         mode = PlayMode::MONO;
                 else if (!std::strcmp(s, "swiftmono"))    mode = PlayMode::SWIFT_MONO;
                 else if (!std::strcmp(s, "swiftpoly"))    mode = PlayMode::SWIFT_POLY;
+                else if (!std::strcmp(s, "goertzelmono")) mode = PlayMode::GOERTZEL_MONO;
                 else if (!std::strcmp(s, "goertzelpoly")) mode = PlayMode::GOERTZEL_POLY;
                 else                                      mode = PlayMode::POLY;
                 modeSet = true;
@@ -1229,6 +1306,8 @@ int main(int argc, char** argv)
                 else                                  prov = ProvMode::ON;
                 provSet = true;
             }
+            else if (!std::strcmp(argv[i], "--max-poly") && i+1 < argc)
+                maxPolyOverride = std::max(1, std::min(6, std::atoi(argv[++i])));
             else { printUsage(argv[0]); return 1; }
         }
 
@@ -1291,6 +1370,7 @@ int main(int argc, char** argv)
         if (ampFloor >= 0)   rangeCfg.ampFloor         = ampFloor;
         if (modeSet)         rangeCfg.mode             = mode;
         if (provSet)         rangeCfg.provisionalMode  = prov;
+        if (maxPolyOverride >= 1) rangeCfg.maxPoly    = maxPolyOverride;
 
         if (rangeCfg.ranges.empty()) {
             NoteRange low;  low.name = "low";  low.midiLow = 0;  low.midiHigh = 48;

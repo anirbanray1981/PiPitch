@@ -81,6 +81,7 @@ enum PortIndex {
     PORT_ONSET_BLANK_MS  = 8,
     PORT_PROVISIONAL     = 9,
     PORT_BEND            = 10,
+    PORT_MAX_POLY        = 11,
 };
 
 // ── MIDI output channel (0-indexed: 0 = ch1, 1 = ch2, etc.) ──────────────────
@@ -132,24 +133,28 @@ struct PiPitchPlugin {
     const float*       onsetBlankMsPort;
     const float*       provisionalPort;
     const float*       bendPort;
+    const float*       maxPolyPort;
 
     double sampleRate;
 
     std::atomic<float> thresholdVal{0.6f};
-    std::atomic<float> frameThresholdVal{0.5f};
-    std::atomic<float> ampFloorVal{0.65f};
-    std::atomic<int>   modeVal{1};  // 0=poly, 1=mono, 2=swiftmono, 3=swiftpoly (default: mono)
+    std::atomic<float> frameThresholdVal{0.4f};
+    std::atomic<float> ampFloorVal{0.3f};
+    std::atomic<int>   modeVal{4};  // default: goertzelmono
     std::atomic<int>   provisionalVal{0};  // 0=on, 1=swift, 2=none
     std::atomic<bool>  bendVal{false};
+    std::atomic<int>   maxPolyVal{3};
     float              octaveLockMsVal = 250.0f;  // from config (not an LV2 port)
 
     std::unique_ptr<SwiftF0Detector> swiftF0;  // null if model not found
 #ifdef __aarch64__
-    UltraLowLatencyGoertzel          goertzel; // GoertzelPoly mode (audio-thread, zero-latency)
+    UltraLowLatencyGoertzel          goertzel; // GoertzelMono mode (audio-thread, zero-latency)
     uint64_t goertzelPrevBits = 0;
     int      goertzelBentFrom = -1;  // MIDI note the synth has (note-ON was sent for this)
     int      goertzelBentTo   = -1;  // MIDI note we've bent to (what Goertzel considers active)
     int      goertzelNoteWindow = 0; // samples remaining: new note-ONs only when > 0
+    // GoertzelPoly mode: multi-note onset window
+    int      goertzelPolyOnCount = 0;  // notes fired in current onset window
 #endif
     std::vector<float>               sf0Buf;   // worker-thread scratch: 16 kHz resampled audio
 
@@ -195,9 +200,11 @@ struct ImplWorkerHooks {
     int                 provisionalMode(){ return self->provisionalVal.load(std::memory_order_relaxed); }
     float               octaveLockMs()   { return self->octaveLockMsVal; }
     bool                bendEnabled()    { return self->bendVal.load(std::memory_order_relaxed); }
+    int                 maxPoly()        { return self->maxPolyVal.load(std::memory_order_relaxed); }
     auto&               ranges()         { return self->ranges; }
 
     // No logging in LV2 plugin
+    void onGoertzelPolyResult(RangeState&, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, double) {}
     void onSwiftResult    (RangeState&, int, double) {}
     void onSwiftPolyResult(RangeState&, int, double, uint64_t, double) {}
     void onCNNOutcome     (RangeState&, int, uint64_t, double) {}
@@ -305,6 +312,7 @@ static LV2_Handle instantiate(const LV2_Descriptor*,
     cfgPath += "pipitch_ranges.conf";
     RangeConfig rangeCfg = loadRangeConfig(cfgPath);
     self->octaveLockMsVal = rangeCfg.octaveLockMs;
+    self->maxPolyVal.store(rangeCfg.maxPoly, std::memory_order_relaxed);
 
     auto makeRange = [&](const NoteRange& cfg) {
         auto r             = std::make_unique<RangeState>();
@@ -373,6 +381,7 @@ static void connectPort(LV2_Handle instance, uint32_t port, void* data)
         case PORT_ONSET_BLANK_MS:  self->onsetBlankMsPort   = static_cast<const float*>(data);       break;
         case PORT_PROVISIONAL:    self->provisionalPort    = static_cast<const float*>(data);       break;
         case PORT_BEND:           self->bendPort           = static_cast<const float*>(data);       break;
+        case PORT_MAX_POLY:       self->maxPolyPort        = static_cast<const float*>(data);       break;
     }
 }
 
@@ -446,6 +455,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     if (self->modePort)           self->modeVal.store(static_cast<int>(*self->modePort + 0.5f), std::memory_order_relaxed);
     if (self->provisionalPort)    self->provisionalVal.store(static_cast<int>(*self->provisionalPort + 0.5f), std::memory_order_relaxed);
     if (self->bendPort)           self->bendVal.store(*self->bendPort > 0.5f, std::memory_order_relaxed);
+    if (self->maxPolyPort)        self->maxPolyVal.store(std::max(1, std::min(6, static_cast<int>(*self->maxPolyPort + 0.5f))), std::memory_order_relaxed);
     if (self->ampFloor)           self->ampFloorVal.store(*self->ampFloor, std::memory_order_relaxed);
 
     if (self->audioOut)
@@ -518,11 +528,26 @@ static void run(LV2_Handle instance, uint32_t nSamples)
     static const float zeros[8192] = {};
 
     // Push audio into each range's ring; dispatch snapshot when ready — lockless
-    // GoertzelPoly bypasses the entire ring/OBP/CNN pipeline.
-    const bool goertzelMode = (self->modeVal.load(std::memory_order_relaxed) == 4);
+    // GoertzelMono bypasses the entire ring/OBP/CNN pipeline.
+    // GoertzelPoly needs ring+dispatch for CNN but skips OBP/provisional.
+    const int  modeVal = self->modeVal.load(std::memory_order_relaxed);
+    const bool goertzelMono = (modeVal == 4);
+    const bool goertzelPoly = (modeVal == 5);
     for (auto& rp : self->ranges) {
         RangeState& r = *rp;
-        if (goertzelMode) continue;
+        if (goertzelMono) continue;
+
+        // GoertzelPoly: feed ring buffer and dispatch for CNN, skip OBP/provisional
+        if (goertzelPoly) {
+            if (!gated) {
+                // Don't flush ring on onset — CNN needs full audio context for chord ID
+                pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
+            } else {
+                pushToRing(r, self->sampleRate, zeros, static_cast<int>(nSamples));
+            }
+            dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem, gateFloor);
+            continue;
+        }
 
         if (!gated) {
             // Flush ring on onset: zero stale audio so SwiftF0 only sees the
@@ -535,7 +560,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
             pushToRing(r, self->sampleRate, self->audioIn, static_cast<int>(nSamples));
 
             // Two-phase OneBitPitch + MPM — skipped when provisional != on.
-            // (GoertzelPoly never reaches here — range loop is skipped above.)
+            // (GoertzelMono never reaches here — range loop is skipped above.)
             const int pvNow = self->provisionalVal.load(std::memory_order_relaxed);
             const bool provEnabled = (pvNow == 0 || pvNow == 3);  // on or adaptive
             if (provEnabled) {
@@ -783,10 +808,10 @@ static void run(LV2_Handle instance, uint32_t nSamples)
         dispatchSnapshotIfReady(r, onsetFired, 0.0, self->workerSem, gateFloor);
     }
 
-    // ── GoertzelPoly: sample-by-sample processing in audio thread ──────────
+    // ── GoertzelMono: sample-by-sample processing in audio thread ──────────
     // Only available on AArch64 (Pi 5) — requires NEON SIMD.
 #ifdef __aarch64__
-    if (self->modeVal.load(std::memory_order_relaxed) == 4 && !gated) {
+    if (goertzelMono && !gated) {
         self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples), onsetFired);
 
         auto& states = self->goertzel.getNoteStates();
@@ -903,7 +928,7 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 self->goertzelPrevBits &= ~(1ULL << (gOff[j].midi - NOTE_BASE));
             }
         }
-    } else if (self->modeVal.load(std::memory_order_relaxed) == 4 && gated) {
+    } else if (goertzelMono && gated) {
         // Center any active bend before gated drain
         if (self->goertzelBentFrom >= 0) {
             writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
@@ -924,6 +949,74 @@ static void run(LV2_Handle instance, uint32_t nSamples)
                 self->goertzelPrevBits &= ~bit;
             }
         }
+    }
+
+    // ── GoertzelPoly: Goertzel scout + CNN confirmation ──────────────────────
+    // Goertzel runs in audio thread (fast note-ONs at muted velocity).
+    // CNN runs in worker thread (confirms/vetoes/adds — see runWorkerCommon).
+    if (goertzelPoly && !gated) {
+        self->goertzel.processBlock(self->audioIn, static_cast<int>(nSamples), onsetFired, true);
+
+        auto& states = self->goertzel.getNoteStates();
+        const int gStart = self->goertzel.startMidi();
+        const int maxPoly = self->maxPolyVal.load(std::memory_order_relaxed);
+
+        // Onset gate: open window for up to maxPoly note-ONs.
+        // If a window is already open (strum in progress), extend it
+        // but keep accumulating — don't reset the count.
+        if (onsetFired) {
+            if (self->goertzelNoteWindow <= 0)
+                self->goertzelPolyOnCount = 0;  // new strum — reset count
+            self->goertzelNoteWindow = static_cast<int>(self->sampleRate * 0.05);  // 50ms
+        }
+        if (self->goertzelNoteWindow > 0)
+            self->goertzelNoteWindow -= static_cast<int>(nSamples);
+
+        // Collect transitions
+        for (int i = 0; i < self->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            auto& s = states[i];
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+
+            // Note-ON: muted velocity, no octave-lock, up to maxPoly per window
+            if (s.isActive() && s.triggerPending && !(self->goertzelPrevBits & bit)) {
+                s.triggerPending = false;
+                if (self->goertzelNoteWindow > 0 && self->goertzelPolyOnCount < maxPoly) {
+                    writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                              NOTE_ON_STATUS, static_cast<uint8_t>(midi), uint8_t(40));
+                    self->goertzelPrevBits |= bit;
+                    self->goertzelPolyOnCount++;
+                }
+            }
+            // Note-OFF: always allowed
+            if (!s.isActive() && (self->goertzelPrevBits & bit)) {
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          NOTE_OFF_STATUS, static_cast<uint8_t>(midi), uint8_t(0));
+                self->goertzelPrevBits &= ~bit;
+            }
+        }
+
+        // Update per-range goertzelPolyActiveBits for worker comparison
+        for (auto& rp : self->ranges)
+            rp->goertzelPolyActiveBits.store(self->goertzelPrevBits, std::memory_order_release);
+
+    } else if (goertzelPoly && gated) {
+        self->goertzel.drainGated(static_cast<int>(nSamples));
+        auto& states = self->goertzel.getNoteStates();
+        const int gStart = self->goertzel.startMidi();
+        for (int i = 0; i < self->goertzel.numNotes(); ++i) {
+            const int midi = gStart + i;
+            if (midi < NOTE_BASE || midi >= NOTE_BASE + NOTE_COUNT) continue;
+            const uint64_t bit = 1ULL << (midi - NOTE_BASE);
+            if (!states[i].isActive() && (self->goertzelPrevBits & bit)) {
+                writeMidi(&self->forge, 0, self->uris.midi_MidiEvent,
+                          NOTE_OFF_STATUS, static_cast<uint8_t>(midi), uint8_t(0));
+                self->goertzelPrevBits &= ~bit;
+            }
+        }
+        for (auto& rp : self->ranges)
+            rp->goertzelPolyActiveBits.store(self->goertzelPrevBits, std::memory_order_release);
     }
 #endif // __aarch64__
 

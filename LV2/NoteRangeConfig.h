@@ -41,7 +41,7 @@
 #include <string>
 #include <vector>
 
-enum class PlayMode { POLY, MONO, SWIFT_MONO, SWIFT_POLY, GOERTZEL_POLY };
+enum class PlayMode { POLY, MONO, SWIFT_MONO, SWIFT_POLY, GOERTZEL_MONO, GOERTZEL_POLY };
 enum class ProvMode { ON = 0, SWIFT = 1, NONE = 2, ADAPTIVE = 3 };
 
 struct NoteRange {
@@ -57,15 +57,16 @@ struct NoteRange {
 struct RangeConfig {
     std::vector<NoteRange> ranges;
     float     gateFloor      = 0.003f;
-    float     ampFloor       = 0.65f;
+    float     ampFloor       = 0.3f;
     float     threshold      = 0.6f;   // onset sensitivity (0.05–0.95)
-    float     frameThreshold = 0.5f;   // frame confidence (0.05–0.95)
+    float     frameThreshold = 0.4f;   // frame confidence (0.05–0.95)
     float     onsetBlankMs      = 25.0f;  // re-trigger suppression window (ms)
     float     swiftF0Threshold  = 0.5f;   // SwiftF0 per-frame confidence (swiftmono mode)
     float     octaveLockMs      = 250.0f;  // suppress ±12/24 semitone jumps in swiftmono (0=off)
-    PlayMode  mode              = PlayMode::MONO;
+    PlayMode  mode              = PlayMode::GOERTZEL_MONO;
     ProvMode  provisionalMode  = ProvMode::ON;
     bool      bendEnabled      = false;  // 14-bit MIDI pitch bend (swiftmono only)
+    int       maxPoly          = 3;      // max simultaneous notes in GoertzelPoly (1-6)
 };
 
 // Return the first range whose [midiLow, midiHigh] contains pitch, or nullptr.
@@ -123,6 +124,7 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
             if      (val == "mono")         cfg.mode = PlayMode::MONO;
             else if (val == "swiftmono")  cfg.mode = PlayMode::SWIFT_MONO;
             else if (val == "swiftpoly")  cfg.mode = PlayMode::SWIFT_POLY;
+            else if (val == "goertzelmono") cfg.mode = PlayMode::GOERTZEL_MONO;
             else if (val == "goertzelpoly") cfg.mode = PlayMode::GOERTZEL_POLY;
             else                          cfg.mode = PlayMode::POLY;
             continue;
@@ -139,6 +141,8 @@ static inline RangeConfig loadRangeConfig(const std::string& path)
             else                     cfg.provisionalMode = ProvMode::ON;
             continue;
         }
+
+        if (key == "max_poly")       { cfg.maxPoly        = std::max(1, std::min(6, std::stoi(val))); continue; }
 
         if (!cur) continue; // range-specific keys only valid inside [range]
 
