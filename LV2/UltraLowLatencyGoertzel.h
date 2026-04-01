@@ -202,6 +202,8 @@ public:
     {
         if (nSamples <= 0 || nSamples > MAX_BLOCK_SIZE) return;
 
+        polyMode_ = polyMode;
+
         // Handle onset: start blanking + elevated threshold window
         if (onsetFired) {
             blankRemain_ = onsetBlankSamples_;
@@ -459,6 +461,7 @@ private:
     int   blankRemain_       = 0;   // samples remaining in onset blank
     int   onsetRemain_       = 0;   // samples remaining in elevated-threshold window
     int   onsetBlankSamples_ = 0;   // precomputed from ONSET_BLANK_MS
+    bool  polyMode_          = false;
     int   onsetWindowSamples_= 0;   // precomputed from ONSET_WINDOW_MS
     std::vector<BinGroup>   groups_;
     std::vector<NoteState>  noteStates_;
