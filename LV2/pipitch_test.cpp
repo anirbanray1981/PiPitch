@@ -811,7 +811,7 @@ static void processTestBlock(TestState* st, const float* blockIn, int nSamples)
         if (onsetFired) {
             if (st->goertzelNoteWindow <= 0)
                 st->goertzelPolyOnCount = 0;
-            st->goertzelNoteWindow = static_cast<int>(st->sampleRate * 0.05);
+            st->goertzelNoteWindow = static_cast<int>(st->sampleRate * 0.05);  // 50ms
         }
         if (st->goertzelNoteWindow > 0)
             st->goertzelNoteWindow -= nSamples;

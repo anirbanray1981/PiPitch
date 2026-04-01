@@ -373,12 +373,18 @@ struct RangeStateBase {
     // GoertzelPoly: audio thread writes current Goertzel active bitmap so the
     // worker can compare CNN output against what Goertzel has sounding.
     std::atomic<uint64_t> goertzelPolyActiveBits{0};
+    // Audio→worker: notes Goertzel scouted (fired at vel 40) this onset.
+    // These are real played notes — CNN cannot veto them.
+    std::atomic<uint64_t> goertzelScoutedBits{0};
     // Worker-only: tracks which notes CNN has confirmed (boosted velocity)
     uint64_t              goertzelCNNConfirmed = 0;
     // Worker-only: per-note CNN-absence counter for veto hold.
     // Incremented when CNN doesn't see a note that Goertzel has.
     // Only when counter exceeds holdCycles does veto fire.
     alignas(8) int8_t     goertzelVetoCount[NOTE_COUNT] = {};
+    // Worker-only: notes currently fading out (CNN vetoed, velocity ramping down).
+    uint64_t              goertzelFadingBits = 0;
+    alignas(8) int8_t     goertzelFadeRemain[NOTE_COUNT] = {};  // cycles remaining in fade
 
     // Pitch bend tracker (worker-only, swiftmono)
     PitchBendTracker    bendTracker;
@@ -1259,16 +1265,28 @@ static void runWorkerCommon(Hooks& h)
                 for (uint64_t tmp = newBits; tmp; tmp &= tmp - 1)
                     r.goertzelVetoCount[__builtin_ctzll(tmp)] = 0;
 
-                // Add: CNN found notes Goertzel missed → send at full velocity
-                const uint64_t added = newBits & ~goertzelBits & ~r.activeNotes;
-                for (uint64_t tmp = added; tmp; tmp &= tmp - 1) {
-                    const int bit = __builtin_ctzll(tmp);
-                    r.midiOut.push({true, NOTE_BASE + bit, newVel[bit]});
+                // Add: CNN found notes Goertzel missed → send at full velocity.
+                // Onset-gated: only add new notes within 500ms of the last onset.
+                // After that, CNN can only confirm/veto — not introduce new notes.
+                // This prevents CNN from adding ghost harmonics during decay/finger-off.
+                constexpr float CNN_ADD_GATE_MS = 500.0f;
+                const uint64_t elSamp = h.totalSamples() - h.lastOnsetSample();
+                const float msSinceOnset = static_cast<float>(elSamp * 1000.0 / h.sampleRate());
+                const bool addAllowed = (msSinceOnset < CNN_ADD_GATE_MS);
+
+                uint64_t added = 0;
+                if (addAllowed) {
+                    added = newBits & ~goertzelBits & ~r.activeNotes;
+                    for (uint64_t tmp = added; tmp; tmp &= tmp - 1) {
+                        const int bit = __builtin_ctzll(tmp);
+                        r.midiOut.push({true, NOTE_BASE + bit, newVel[bit]});
+                    }
                 }
 
                 // Veto candidates: notes in activeNotes but NOT in CNN and NOT in Goertzel.
                 // While Goertzel still sees the note, it stays alive regardless of CNN.
-                // Only start veto countdown when BOTH Goertzel and CNN drop the note.
+                // Only send note-OFF when BOTH Goertzel and CNN drop the note for
+                // holdCycles consecutive inference cycles.
                 uint64_t vetoNow = 0;
                 const uint64_t mayVeto = r.activeNotes & ~newBits & ~goertzelBits;
                 for (uint64_t tmp = mayVeto; tmp; tmp &= tmp - 1) {
@@ -1280,7 +1298,7 @@ static void runWorkerCommon(Hooks& h)
                     }
                 }
 
-                // Send veto note-OFFs
+                // Send clean note-OFFs for vetoed notes
                 for (uint64_t tmp = vetoNow; tmp; tmp &= tmp - 1) {
                     const int bit = __builtin_ctzll(tmp);
                     r.midiOut.push({false, NOTE_BASE + bit, 0});
