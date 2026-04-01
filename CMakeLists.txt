@@ -63,7 +63,7 @@ if(BUILD_LV2)
             OUTPUT_NAME "${OUTPUT_NAME}"
             LIBRARY_OUTPUT_DIRECTORY "${LV2_BUNDLE_DIR}"
             # Look for libonnxruntime.so in the same directory as the plugin .so
-            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
+            BUILD_RPATH   "\$ORIGIN"
             INSTALL_RPATH "\$ORIGIN"
         )
         target_compile_features(PiPitchImpl_${SUFFIX} PRIVATE cxx_std_17)
@@ -161,8 +161,8 @@ if(BUILD_LV2)
             ${LIB_MODEL_SOURCES}
         )
         set_target_properties(latency_bench PROPERTIES
-            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
-            INSTALL_RPATH "${LV2_ONNXRUNTIME_DIR}"
+            BUILD_RPATH   "${LV2_BUNDLE_DIR}"
+            INSTALL_RPATH "\$ORIGIN/${LV2_BUNDLE_NAME}"
         )
         target_compile_features(latency_bench PRIVATE cxx_std_17)
         target_compile_options(latency_bench PRIVATE -O2 -fPIC)
@@ -196,8 +196,8 @@ if(BUILD_LV2)
             ${LIB_MODEL_SOURCES}
         )
         set_target_properties(pipitch_tune PROPERTIES
-            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
-            INSTALL_RPATH "${LV2_ONNXRUNTIME_DIR}"
+            BUILD_RPATH   "${LV2_BUNDLE_DIR}"
+            INSTALL_RPATH "\$ORIGIN/${LV2_BUNDLE_NAME}"
         )
         target_compile_features(pipitch_tune PRIVATE cxx_std_17)
         target_compile_options(pipitch_tune PRIVATE -O2 -fPIC)
@@ -233,8 +233,8 @@ if(BUILD_LV2)
             ${LIB_MODEL_SOURCES}
         )
         set_target_properties(pipitch_test PROPERTIES
-            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
-            INSTALL_RPATH "${LV2_ONNXRUNTIME_DIR}"
+            BUILD_RPATH   "${LV2_BUNDLE_DIR}"
+            INSTALL_RPATH "\$ORIGIN/${LV2_BUNDLE_NAME}"
         )
         target_compile_features(pipitch_test PRIVATE cxx_std_17)
         target_compile_options(pipitch_test PRIVATE -O2 -fPIC)
