@@ -241,14 +241,35 @@ PiPitch/
 
 ## Building
 
+### Prerequisites
+
+- **LV2 development headers**: `sudo apt install lv2-dev`
+- **JACK** (for tune/test tools): `sudo apt install libjack-jackd2-dev`
+- **FFTW3** (for MPM pitch detection): `sudo apt install libfftw3-dev`
+- **ONNX Runtime** (for SwiftF0): the NeuralNote submodule includes headers
+  and a pre-built `libonnxruntime.so` for Linux aarch64 (Pi 4/5) at
+  `NeuralNote/ThirdParty/onnxruntime/`.  This is available automatically
+  after `git clone --recurse-submodules`.  For x86_64 or other platforms,
+  download ONNX Runtime from https://github.com/microsoft/onnxruntime/releases
+  and either place it at the same path or install system-wide.
+
+On Raspberry Pi OS (aarch64):
 ```bash
-# From the repository root (requires NeuralNote submodule)
+sudo apt install lv2-dev libjack-jackd2-dev libfftw3-dev
+```
+
+### Build
+
+```bash
 git clone --recurse-submodules https://github.com/anirbanray1981/PiPitch.git
 cd PiPitch
 
 cmake -B build -DBUILD_LV2=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
+
+**Note:** If CMake cannot find `onnxruntime`, ensure the NeuralNote submodule
+is fully initialised: `git submodule update --init --recursive`.
 
 ### Build targets
 
