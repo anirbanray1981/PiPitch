@@ -268,6 +268,10 @@ cmake -B build -DBUILD_LV2=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
+The build copies `libonnxruntime.so` into the LV2 bundle (`pipitch.lv2/`)
+so the plugin is self-contained — no system-wide onnxruntime install needed.
+The impl `.so` files use `$ORIGIN` rpath to find the bundled library.
+
 **Note:** If CMake cannot find `onnxruntime`, ensure the NeuralNote submodule
 is fully initialised: `git submodule update --init --recursive`.
 

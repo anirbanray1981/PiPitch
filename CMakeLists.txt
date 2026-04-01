@@ -47,6 +47,10 @@ if(BUILD_LV2)
     endif()
     message(STATUS "LV2: using onnxruntime: ${LV2_ONNXRUNTIME_LIB}")
 
+    # Resolve the directory containing libonnxruntime.so for rpath + bundle copy
+    get_filename_component(LV2_ONNXRUNTIME_DIR "${LV2_ONNXRUNTIME_LIB}" DIRECTORY)
+    get_filename_component(LV2_ONNXRUNTIME_NAME "${LV2_ONNXRUNTIME_LIB}" NAME)
+
     # ── Helper: create one implementation .so ─────────────────────────────────
     function(pipitch_add_impl SUFFIX OUTPUT_NAME)
         set(MARCH_FLAGS ${ARGN})
@@ -58,6 +62,9 @@ if(BUILD_LV2)
             PREFIX ""
             OUTPUT_NAME "${OUTPUT_NAME}"
             LIBRARY_OUTPUT_DIRECTORY "${LV2_BUNDLE_DIR}"
+            # Look for libonnxruntime.so in the same directory as the plugin .so
+            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
+            INSTALL_RPATH "\$ORIGIN"
         )
         target_compile_features(PiPitchImpl_${SUFFIX} PRIVATE cxx_std_17)
         target_compile_options(PiPitchImpl_${SUFFIX} PRIVATE
@@ -135,6 +142,12 @@ if(BUILD_LV2)
         COMMAND ${CMAKE_COMMAND} -E copy
             ${CMAKE_SOURCE_DIR}/LV2/swift_f0_model.onnx
             ${LV2_BUNDLE_DIR}/swift_f0_model.onnx
+        COMMAND ${CMAKE_COMMAND} -E copy
+            ${LV2_ONNXRUNTIME_LIB}
+            ${LV2_BUNDLE_DIR}/${LV2_ONNXRUNTIME_NAME}
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            ${LV2_ONNXRUNTIME_NAME}
+            ${LV2_BUNDLE_DIR}/libonnxruntime.so.1
         COMMENT "Assembling LV2 bundle: ${LV2_BUNDLE_DIR}"
     )
 
@@ -146,6 +159,10 @@ if(BUILD_LV2)
         add_executable(latency_bench
             ${CMAKE_SOURCE_DIR}/LV2/latency_bench.cpp
             ${LIB_MODEL_SOURCES}
+        )
+        set_target_properties(latency_bench PROPERTIES
+            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
+            INSTALL_RPATH "${LV2_ONNXRUNTIME_DIR}"
         )
         target_compile_features(latency_bench PRIVATE cxx_std_17)
         target_compile_options(latency_bench PRIVATE -O2 -fPIC)
@@ -177,6 +194,10 @@ if(BUILD_LV2)
         add_executable(pipitch_tune
             ${CMAKE_SOURCE_DIR}/LV2/pipitch_tune.cpp
             ${LIB_MODEL_SOURCES}
+        )
+        set_target_properties(pipitch_tune PROPERTIES
+            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
+            INSTALL_RPATH "${LV2_ONNXRUNTIME_DIR}"
         )
         target_compile_features(pipitch_tune PRIVATE cxx_std_17)
         target_compile_options(pipitch_tune PRIVATE -O2 -fPIC)
@@ -210,6 +231,10 @@ if(BUILD_LV2)
         add_executable(pipitch_test
             ${CMAKE_SOURCE_DIR}/LV2/pipitch_test.cpp
             ${LIB_MODEL_SOURCES}
+        )
+        set_target_properties(pipitch_test PROPERTIES
+            BUILD_RPATH   "${LV2_ONNXRUNTIME_DIR}"
+            INSTALL_RPATH "${LV2_ONNXRUNTIME_DIR}"
         )
         target_compile_features(pipitch_test PRIVATE cxx_std_17)
         target_compile_options(pipitch_test PRIVATE -O2 -fPIC)
