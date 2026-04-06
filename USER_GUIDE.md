@@ -23,11 +23,11 @@ PiPitch has 6 detection modes. Choose based on your playing style:
 | Mode | # | Best for | Latency |
 |------|---|----------|---------|
 | **GoertzelMono** | 4 | Single notes, fastest response | 15--60 ms |
-| **GoertzelPoly** | 5 | Chords (up to 6 notes) | 15--60 ms + CNN confirm |
+| **GoertzelPoly** | 5 | Chords (up to 6 notes) | 15--60 ms + Neural Network confirmation |
 | **SwiftMono** | 2 | Single notes with pitch bend | 70--140 ms |
 | **SwiftPoly** | 3 | Fast note-on + polyphonic sustain | ~100 ms |
-| **Mono** | 1 | Single notes (CNN-only) | 95--185 ms |
-| **Poly** | 0 | Polyphonic (CNN-only) | 95--185 ms |
+| **Mono** | 1 | Single notes detected by Neural Network | 95--185 ms |
+| **Poly** | 0 | Polyphonic detected by Neural Network | 95--185 ms |
 
 **Recommended:** Start with **GoertzelMono** (default). Switch to **GoertzelPoly** for chords or **SwiftMono** if you want pitch bend for vibrato/bends.
 
@@ -39,11 +39,11 @@ PiPitch has 6 detection modes. Choose based on your playing style:
 |---------|---------|--------------|
 | **Mode** | GoertzelMono (4) | Detection algorithm (see above) |
 | **Onset sensitivity** | 0.6 | How easily a new note triggers. Lower = more sensitive. |
-| **Noise gate floor** | 0.003 | Below this level, input is treated as silence. Raise if you get ghost notes from amp hum. |
-| **Amplitude floor** | 0.3 | CNN confidence floor (poly/mono/goertzelpoly modes). Lower catches quieter notes but may add false detections. |
-| **Frame threshold** | 0.4 | Per-frame CNN confidence (poly/mono/goertzelpoly). Lower = more permissive. |
+| **Noise gate floor** | 0.003 | Below this level, input is treated as silence. Adjust to compensate the noise from your guitar input. |
+| **Amplitude floor** | 0.3 | Neural Network confidence floor (poly/mono/goertzelpoly modes). Lower catches quieter notes but may add false detections. |
+| **Frame threshold** | 0.4 | Per-frame Neural Network confidence (poly/mono/goertzelpoly). Lower = more permissive. |
 | **Onset blank (ms)** | 25 | Minimum time between re-triggers. Raise if you get stuttering on sustained notes. |
-| **Provisional** | On (0) | Fast note detection before CNN confirms. "On" for lowest latency; "None" for safest. |
+| **Provisional** | On (0) | Fast note detection before Neural Network confirms. "On" for lowest latency; "None" for safest. |
 | **Pitch bend** | Off | 14-bit pitch bend tracking (SwiftMono only). Enable for vibrato and string bends. |
 | **Max polyphony** | 3 | Maximum simultaneous notes in GoertzelPoly mode (1--6). |
 
@@ -69,12 +69,15 @@ PiPitch has 6 detection modes. Choose based on your playing style:
 ### Reducing latency
 - **GoertzelMono** is the fastest mode (15--60 ms depending on pitch)
 - Higher notes are detected faster than lower notes in all modes
-- **Provisional = On** fires a fast note guess before the CNN confirms (poly/mono modes)
+- **Provisional = On** fires a fast note guess before the Neural Network confirms (poly/mono modes)
 
 ### Reducing false notes
 - Raise **noise gate floor** if your signal is noisy
-- Set **provisional = None** to only emit CNN-confirmed notes (higher latency but no wrong guesses)
-- In **GoertzelPoly**, the CNN automatically vetoes harmonic ghosts from the Goertzel scout
+- Set **provisional = None** to only emit Neural Network-confirmed notes (higher latency but no wrong guesses)
+- In **GoertzelPoly**, the Neural Network automatically vetoes harmonic ghosts from the Goertzel scout
+
+### Recommended Guitar Level
+- The plugin works best at -12 to -18 dbfs input level from the guitar.
 
 ---
 
@@ -107,7 +110,7 @@ The detection range is split into 5 internal zones, each tuned for its frequency
 |---------|-----|
 | No MIDI output | Check audio routing -- guitar must be connected to `audio_in` |
 | Ghost notes from silence | Raise **noise gate floor** (try 0.01) |
-| Wrong octave detected | Normal for CNN modes on low notes; use **GoertzelMono** for best accuracy |
+| Wrong octave detected | Normal for Neural Network modes on low notes; use **GoertzelMono** for best accuracy |
 | Notes stutter/re-trigger | Raise **onset blank** to 40--50 ms |
 | Chords missing notes | Lower **amplitude floor** to 0.2; use **GoertzelPoly** mode |
 | High latency | Switch to **GoertzelMono**; ensure you're on Pi 5 |
