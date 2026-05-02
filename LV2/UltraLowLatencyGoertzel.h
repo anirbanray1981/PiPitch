@@ -61,8 +61,8 @@ public:
     };
 
     static constexpr int   CONFIDENCE_VHIGH  = 14;      // eval cycles for E2 (~56ms)
-    static constexpr int   CONFIDENCE_HIGH2  = 7;       // eval cycles for notes F2–A#2 (~28ms)  [tuned 2026-04-11]
-    static constexpr int   CONFIDENCE_HIGH   = 5;       // eval cycles for notes below F4 (~20ms)  [tuned 2026-04-11]
+    static constexpr int   CONFIDENCE_HIGH2  = 10;      // eval cycles for notes F2–A#2 (~40ms)
+    static constexpr int   CONFIDENCE_HIGH   = 6;       // eval cycles for notes below F4 (~24ms)
     static constexpr int   CONFIDENCE_LOW    = 3;       // eval cycles for notes F4 and above (~12ms)
     static constexpr int   HOLD_EVAL_CYCLES  = 8;       // ~32ms hold after note-ON (8 × 4ms)
     static constexpr int   OFF_GRACE_CYCLES  = 50;      // ~200ms grace after OFF for harmonic suppression
